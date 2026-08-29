@@ -30,8 +30,18 @@ class FrameAnalyzer(
     /** Flow mode center-crop toggle (#14). Default on: flow mode is the walking default. */
     @Volatile var centerCrop: Boolean = true
 
+    /**
+     * Thermal governor knob: process only every Nth analysis frame, skip the rest (still
+     * closed so the pipeline doesn't stall). 1 = every frame. Set by [ThermalGovernor] via
+     * MainActivity as the SoC heats up in the harness.
+     */
+    @Volatile var processEveryN: Int = 1
+    private var frameCounter = 0L
+
     override fun analyze(image: ImageProxy) {
         try {
+            val n = processEveryN.coerceAtLeast(1)
+            if (frameCounter++ % n != 0L) return
             val bitmap = image.toBitmapUpright()
             if (bitmap != null) {
                 val result = engine.infer(bitmap, centerCrop)

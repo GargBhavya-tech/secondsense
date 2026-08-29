@@ -24,7 +24,9 @@ import ai.secondsense.app.sensors.ImuTracker
  */
 class SceneAnalyzer(
     private val imuTracker: ImuTracker? = null,
-    private val hazardEveryN: Int = 1,
+    /** every Nth call runs the expensive RANSAC/Hough evidence gather; reused in between.
+     *  Runtime-adjustable by the thermal governor (via the engine's setHazardEveryN). */
+    @Volatile var hazardEveryN: Int = 1,
 ) {
     private val motion = MotionTracker()
     private val groundPlaneAnalyzer = GroundPlaneAnalyzer()
@@ -56,7 +58,7 @@ class SceneAnalyzer(
 
     fun analyze(frame: Bitmap, depthFrame: DepthSampler.Frame, detections: List<Detection>): Result {
         val curGray = OpticalFlow.toGrayscale(frame, GRAY_W, GRAY_H)
-        val runHeavy = lastEvidence == null || (tick++ % hazardEveryN == 0L)
+        val runHeavy = lastEvidence == null || (tick++ % hazardEveryN.coerceAtLeast(1) == 0L)
 
         val camHealth = cameraHealthMonitor.update(
             curGray,

@@ -48,4 +48,12 @@ interface InferenceEngine {
 
     /** Release native resources. No-op for the mock. */
     fun close()
+
+    /**
+     * Thermal-governor cadence knobs. Defaults no-op so the mock and any future engine ignore
+     * them. Real engines run Depth-Anything every Nth processed frame and the RANSAC/Hough
+     * drop-off fusion every Nth processed frame, reusing the last result in between.
+     */
+    fun setDepthEveryN(n: Int) {}
+    fun setHazardEveryN(n: Int) {}
 }

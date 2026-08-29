@@ -27,6 +27,8 @@ import ai.secondsense.app.memory.DeadReckoner
 import ai.secondsense.app.memory.MemoryPhrase
 import ai.secondsense.app.memory.ObjectMemory
 import ai.secondsense.app.sensors.PedometerTracker
+import ai.secondsense.app.perf.PerfPolicy
+import ai.secondsense.app.perf.ThermalGovernor
 import ai.secondsense.app.sonification.CueTarget
 import ai.secondsense.app.sonification.ObstacleHabituation
 import java.util.Locale
@@ -154,6 +156,12 @@ class MainActivity : AppCompatActivity() {
     private val deadReckoner = DeadReckoner()
     private val objectMemory = ObjectMemory()
     @Volatile private var memoryNavActive = false
+
+    // Problem Statement 6 — thermal throttling / deterministic latency in the closed harness.
+    private val thermalGovernor by lazy { ThermalGovernor(walkingSupplier = { pedometer.isWalking }) }
+    @Volatile private var perceptionEnabled = true
+    @Volatile private var yamnetWanted = true
+    @Volatile private var lowResActive = false
 
     private fun currentPose(): DeadReckoner.Pose =
         deadReckoner.pose(EngineConfig.imuTracker?.headingDeg ?: 0f)
@@ -295,7 +303,7 @@ class MainActivity : AppCompatActivity() {
         analyzer = FrameAnalyzer(
             engine,
             onResult = { result -> onFrameResult(result) },
-            frameSink = { bmp -> perception.offer(bmp) },
+            frameSink = { bmp -> if (perceptionEnabled) perception.offer(bmp) },
         )
 
         // --- #6 done-condition: test tone + test buzz on tap ---
@@ -384,6 +392,12 @@ class MainActivity : AppCompatActivity() {
         pedometer.onStep = {
             deadReckoner.onStep(EngineConfig.imuTracker?.headingDeg ?: 0f, pedometer.strideMeters)
         }
+
+        // Thermal governor — turns cadences/resolution/aux load down as the harness heats up.
+        thermalGovernor.onPolicy = { p -> runOnUiThread { applyPerfPolicy(p) } }
+        thermalGovernor.onNotice = { msg ->
+            speakLocalized(msg, langPrefs.speakHindi, TextToSpeech.QUEUE_ADD, "thermal")
+        }
         sceneGestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
             override fun onDoubleTap(e: MotionEvent): Boolean { narrateScene(); return true }
@@ -459,6 +473,11 @@ class MainActivity : AppCompatActivity() {
                 put("mode", modeController.mode.toString())
                 put("inferMs", lastInferenceMs)
                 put("frames", frameCount)
+                put("thermalTier", thermalGovernor.tier.name)
+                put("perfPolicy", thermalGovernor.policy.label)
+                put("p90InferMs", thermalGovernor.p90Ms)
+                put("battTempC", thermalGovernor.batteryTempC.let { if (it.isNaN()) null else it })
+                put("thermalHeadroom", thermalGovernor.headroom.let { if (it.isNaN()) null else it })
                 put("tier", target?.tier?.toString())
                 put("cueLabel", target?.label)
                 put("cueDir", target?.let { if (it.azimuth < 0.4f) "L" else if (it.azimuth > 0.6f) "R" else "C" })
@@ -568,6 +587,28 @@ class MainActivity : AppCompatActivity() {
         lastCamHealth = h
     }
 
+    /** Apply a [PerfPolicy] from the thermal governor — cadences, aux load, resolution. */
+    private fun applyPerfPolicy(p: PerfPolicy) {
+        analyzer.processEveryN = p.frameEveryN
+        engine.setDepthEveryN(p.depthEveryN)
+        engine.setHazardEveryN(p.hazardEveryN)
+        perceptionEnabled = p.auxEnabled
+
+        if (p.yamnetEnabled != yamnetWanted) {
+            yamnetWanted = p.yamnetEnabled
+            if (yamnetWanted) { if (hasMicPermission()) startHazardDetection() } else hazardDetector.stop()
+        }
+        if (p.lowRes != lowResActive) {
+            lowResActive = p.lowRes
+            if (hasCameraPermission()) startCamera()   // rebinds ImageAnalysis at the new size
+        }
+        android.util.Log.i(
+            "SecondSense/thermal",
+            "applied ${p.label}: frame/${p.frameEveryN} depth/${p.depthEveryN} hazard/${p.hazardEveryN} " +
+                "aux=${p.auxEnabled} yamnet=${p.yamnetEnabled} lowRes=${p.lowRes}",
+        )
+    }
+
     /** Double-tap handler: speak a one-sentence description of the current frame (offline). */
     private fun narrateScene() {
         val text = SceneNarrator.describe(lastResult)
@@ -652,10 +693,13 @@ class MainActivity : AppCompatActivity() {
             // Request a modest analysis resolution — the NPU models want small
             // inputs anyway, and this keeps the loop fast. RGBA_8888 so the
             // analyzer's toBitmap() path is direct.
+            // Thermal-aware: drop to 320x240 when the governor says the harness is HOT — halves
+            // the ISP / YUV-convert / optical-flow load. Rebind (via startCamera()) applies it.
+            val analysisSize = if (lowResActive) Size(320, 240) else Size(640, 480)
             val resolutionSelector = ResolutionSelector.Builder()
                 .setResolutionStrategy(
                     ResolutionStrategy(
-                        Size(640, 480),
+                        analysisSize,
                         ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
                     )
                 )
@@ -683,6 +727,7 @@ class MainActivity : AppCompatActivity() {
     private fun onFrameResult(raw: FrameResult) {
         frameCount++
         lastInferenceMs = raw.inferenceMillis
+        thermalGovernor.onInferenceMs(raw.inferenceMillis)
 
         // ACCURACY: multi-frame confidence stabilization — boost consistently re-seen
         // detections, hold down one-frame flickers. Engine-agnostic post-processing.
@@ -832,7 +877,9 @@ class MainActivity : AppCompatActivity() {
 
             binding.hud.text = buildString {
                 append("engine: ${engine.name}   mode: ${modeController.mode}\n")
-                append("frames: $frameCount   infer: ${lastInferenceMs}ms\n")
+                append("frames: $frameCount   infer: ${lastInferenceMs}ms  p90: ${thermalGovernor.p90Ms}ms\n")
+                append("thermal: ${thermalGovernor.tier} [${thermalGovernor.policy.label}]  batt %.1f°C  headroom %.2f\n"
+                    .format(thermalGovernor.batteryTempC, thermalGovernor.headroom))
                 append("dets: ${result.detections.size}   crop: ${analyzer.centerCrop}   son: $sonifying\n")
                 append("cal: ${if (calibration.isCalibrated) "on@%.2f".format(calibration.baselineValue ?: 0f) else "off"}\n")
                 run {
@@ -912,6 +959,7 @@ class MainActivity : AppCompatActivity() {
         EngineConfig.imuTracker?.stop()
         pedometer.stop()
         barometer.stop()
+        thermalGovernor.stop()
         hazardDetector.stop()
         stabilizer.reset()   // camera pauses -> tracks would go stale
         habituation.reset()
@@ -922,8 +970,9 @@ class MainActivity : AppCompatActivity() {
         EngineConfig.imuTracker?.start()
         pedometer.start()
         barometer.start()
+        thermalGovernor.start(this)
         if (sonifying) cueEngine.start()
-        if (hasMicPermission()) startHazardDetection()
+        if (yamnetWanted && hasMicPermission()) startHazardDetection()
     }
 
     override fun onDestroy() {

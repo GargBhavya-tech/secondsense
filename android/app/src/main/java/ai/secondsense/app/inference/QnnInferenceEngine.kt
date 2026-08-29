@@ -50,6 +50,11 @@ class QnnInferenceEngine(
     private val depthSmoother = DepthTemporalSmoother()
     private val sceneAnalyzer = SceneAnalyzer(imuTracker, hazardEveryN = 2)
 
+    // Thermal-governor cadence: skip the depth NPU run on some frames, reuse the last map.
+    @Volatile private var depthEveryN = 2
+    private var depthTick = 0L
+    private var lastDepthFrame: DepthSampler.Frame? = null
+
     @Volatile private var ready = false
 
     override fun initialize() {
@@ -74,11 +79,17 @@ class QnnInferenceEngine(
         val yoloTensors = backend.run("yolo", lb.buffer)
         val rawDets = YoloDecoder.decode(yoloTensors, lb, confThreshold, iouThreshold)
 
-        // --- Depth (runtime-specific) ---
-        val depthLb = Preprocess.letterbox(frame, depthInputSize, normalizeTo01 = true, channelsFirst = channelsFirst)
-        val depthTensor = backend.run("depth", depthLb.buffer).first()
-        val smoothedDepth = RawTensor(depthSmoother.smooth(depthTensor.data), depthTensor.shape)
-        val depthFrame = depthSampler.parse(smoothedDepth)
+        // --- Depth (runtime-specific), throttled by the thermal governor ---
+        val depthFrame: ai.secondsense.app.inference.decode.DepthSampler.Frame
+        if (lastDepthFrame == null || depthTick++ % depthEveryN.coerceAtLeast(1) == 0L) {
+            val depthLb = Preprocess.letterbox(frame, depthInputSize, normalizeTo01 = true, channelsFirst = channelsFirst)
+            val depthTensor = backend.run("depth", depthLb.buffer).first()
+            val smoothedDepth = RawTensor(depthSmoother.smooth(depthTensor.data), depthTensor.shape)
+            depthFrame = depthSampler.parse(smoothedDepth)
+            lastDepthFrame = depthFrame
+        } else {
+            depthFrame = lastDepthFrame!!
+        }
 
         // --- fuse: attach proximity + tier-eligible label to each detection ---
         var detections = rawDets.map { rd ->
@@ -128,10 +139,14 @@ class QnnInferenceEngine(
 
     override fun close() {
         ready = false
+        lastDepthFrame = null
         depthSmoother.reset()
         sceneAnalyzer.reset()
         backend.close()
     }
+
+    override fun setDepthEveryN(n: Int) { depthEveryN = n.coerceIn(1, 12) }
+    override fun setHazardEveryN(n: Int) { sceneAnalyzer.hazardEveryN = n.coerceIn(1, 12) }
 
     fun isOperational(): Boolean = ready
 

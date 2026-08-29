@@ -13,6 +13,8 @@ import ai.secondsense.app.inference.decode.RestingStateVerifier
 import ai.secondsense.app.memory.DeadReckoner
 import ai.secondsense.app.memory.MemoryPhrase
 import ai.secondsense.app.memory.ObjectMemory
+import ai.secondsense.app.perf.PerfPolicy
+import ai.secondsense.app.perf.ThermalTier
 import ai.secondsense.app.sonification.CueTarget
 import ai.secondsense.app.sonification.ObstacleHabituation
 import ai.secondsense.app.voice.SceneNarrator
@@ -249,5 +251,50 @@ class CameraHealthMonitorTest {
         assertEquals(CameraHealth.BLOCKED, m.update(dark, 0f, 0f, imuCalibrated = false, nowMs = 600L))
         assertEquals(CameraHealth.BLOCKED, m.update(normal, 0f, 0f, imuCalibrated = false, nowMs = 700L))
         assertEquals(CameraHealth.OK, m.update(normal, 0f, 0f, imuCalibrated = false, nowMs = 1_300L))
+    }
+}
+
+/** Thermal governor: the perf policy escalates monotonically and keeps a safety floor. */
+class PerfPolicyTest {
+    private val tiers = ThermalTier.values()
+
+    @Test fun cadencesNeverIncreaseAsItCoolsAndNeverHitZero() {
+        var prevFrame = 0; var prevDepth = 0
+        for (t in tiers) {
+            val p = PerfPolicy.policyFor(t, walking = true)
+            assertTrue("$t frameEveryN must not decrease", p.frameEveryN >= prevFrame)
+            assertTrue("$t depthEveryN must not decrease", p.depthEveryN >= prevDepth)
+            assertTrue("$t: no cadence may be < 1", p.frameEveryN >= 1 && p.depthEveryN >= 1 && p.hazardEveryN >= 1)
+            prevFrame = p.frameEveryN; prevDepth = p.depthEveryN
+        }
+    }
+
+    @Test fun idleRelaxesAtLeastAsMuchAsWalking() {
+        for (t in tiers) {
+            val w = PerfPolicy.policyFor(t, walking = true)
+            val i = PerfPolicy.policyFor(t, walking = false)
+            assertTrue("$t idle should skip >= walking", i.frameEveryN >= w.frameEveryN)
+        }
+    }
+
+    @Test fun criticalWhileWalkingKeepsTheCoreLoopAlive() {
+        val p = PerfPolicy.policyFor(ThermalTier.CRITICAL, walking = true)
+        assertTrue("~10fps floor", p.frameEveryN <= 3)
+        assertTrue("depth still ~7fps", p.depthEveryN <= 6)
+    }
+
+    @Test fun auxIsShedBeforeYamnetWhichIsShedBeforeTheCoreLoop() {
+        val hot = PerfPolicy.policyFor(ThermalTier.HOT, walking = true)
+        assertTrue("OCR/face off by HOT", !hot.auxEnabled)
+        assertTrue("YamNet still on at HOT", hot.yamnetEnabled)
+        assertTrue("YamNet off by CRITICAL", !PerfPolicy.policyFor(ThermalTier.CRITICAL, true).yamnetEnabled)
+        assertTrue("low-res only when hot", !PerfPolicy.policyFor(ThermalTier.NOMINAL, true).lowRes &&
+            PerfPolicy.policyFor(ThermalTier.HOT, true).lowRes)
+    }
+
+    @Test fun nominalWalkingIsFullRate() {
+        val p = PerfPolicy.policyFor(ThermalTier.NOMINAL, walking = true)
+        assertEquals(1, p.frameEveryN)
+        assertTrue(p.auxEnabled && p.yamnetEnabled && !p.lowRes)
     }
 }

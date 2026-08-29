@@ -115,7 +115,7 @@ class TfliteInferenceEngine(
     // PERF: depth is the heavy model; run it every Nth frame and reuse the last map in
     // between so YOLO (detection + pan) stays responsive. Proximity changes slowly enough
     // that reusing a 1-frame-old depth map is imperceptible.
-    private val depthEveryN = 2
+    @Volatile private var depthEveryN = 2
     private var depthTick = 0L
     private var lastDepthFrame: DepthSampler.Frame? = null
     private var lastDebugRawCenterProx: Float? = null
@@ -191,7 +191,7 @@ class TfliteInferenceEngine(
         // proximityFor() return a neutral 0.5f everywhere, so downstream code needs no
         // special-casing; it just sees "depth unavailable" honestly.
         val runDepth = debugMode != DebugMode.YOLO_ONLY &&
-            (lastDepthFrame == null || (depthTick++ % depthEveryN == 0L))
+            (lastDepthFrame == null || (depthTick++ % depthEveryN.coerceAtLeast(1) == 0L))
         val depthFrame: DepthSampler.Frame
         if (debugMode == DebugMode.YOLO_ONLY) {
             depthFrame = DepthSampler.Frame(FloatArray(0), 0, 0, 0f, 0f) // invalid: hi==lo
@@ -293,6 +293,9 @@ class TfliteInferenceEngine(
         depthSmoother.reset()
         sceneAnalyzer.reset()
     }
+
+    override fun setDepthEveryN(n: Int) { depthEveryN = n.coerceIn(1, 12) }
+    override fun setHazardEveryN(n: Int) { sceneAnalyzer.hazardEveryN = n.coerceIn(1, 12) }
 
     // ---- helpers -----------------------------------------------------------
 
