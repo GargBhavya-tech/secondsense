@@ -8,6 +8,10 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- Voice goal-seeking (#26): short spoken command capture in scan/seek mode -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Phase 4 "call <contact>" voice task: look up a name and place the call. Requested at
+         runtime, only the first time the user actually asks to call someone. -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
     <!-- #30 laptop dashboard: Android requires INTERNET for ANY socket use, even a server
          that only ever answers requests on the phone's own local Wi-Fi/hotspot. No actual
          internet access is used or needed (Bible §16 / #31 airplane-mode demo). -->

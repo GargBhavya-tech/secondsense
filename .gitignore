@@ -18,6 +18,18 @@ conversion_manifest.json
 # --- Model checkpoints (download from Ultralytics, or produced by convert.py) ---
 *.pt
 
+# --- On-device model weights — NEVER commit (GitHub 100 MB limit; side-loaded per README) ---
+#     MediaPipe LLM (.task), LiteRT-LM (.litertlm), embedding gate (.onnx), GGUF, safetensors.
+#     See android/app/src/llm/README.md and android/app/src/voicegate/README.md.
+*.task
+*.litertlm
+*.onnx
+*.onnx_data
+*.gguf
+*.safetensors
+/models/
+/android/models/
+
 # --- Ad-hoc screenshots (the CV test fixtures used by debug_*.py ARE kept) ---
 baro_check*.png
 dash_check*.png

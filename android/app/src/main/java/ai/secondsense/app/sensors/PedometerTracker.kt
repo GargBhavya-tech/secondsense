@@ -45,6 +45,17 @@ class PedometerTracker(
     /** True while the user appears to be actively walking (a step within the last ~1.4 s). */
     val isWalking: Boolean get() = System.currentTimeMillis() - lastStepAtMs < 1_400L
 
+    /**
+     * Slow EMA of dynamic-acceleration ENERGY (m²/s⁴) — the residual jitter left after gravity
+     * and after footstep peaks decay. Near-zero when standing still (~0.02); a moving vehicle's
+     * sustained low-frequency vibration parks it around 0.2–1.5 even with no steps. Used by
+     * [ai.secondsense.app.context.ContextAutoDetector] to tell "stopped on my feet" from
+     * "sitting in a bus". Time constant ≈ 0.4 s at GAME rate, so it settles within a few seconds
+     * of the motion regime changing.
+     */
+    @Volatile var vibrationLevel: Float = 0f
+        private set
+
     /** Invoked on the sensor thread each time a step is registered. */
     var onStep: (() -> Unit)? = null
 
@@ -53,7 +64,7 @@ class PedometerTracker(
     private var lastStepMs = 0L
 
     fun start() {
-        gravityMag = 9.81f; armed = true; lastStepMs = 0L
+        gravityMag = 9.81f; armed = true; lastStepMs = 0L; vibrationLevel = 0f
         accel?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
     }
 
@@ -67,6 +78,11 @@ class PedometerTracker(
         val mag = sqrt(x * x + y * y + z * z)
         gravityMag += 0.12f * (mag - gravityMag)
         val dyn = mag - gravityMag
+
+        // Sustained-vibration energy. Footstep peaks spike this too, but the ContextAutoDetector
+        // only reads it while isWalking == false and after the step energy has had seconds to
+        // decay, so what's left is the vehicle-floor buzz.
+        vibrationLevel += 0.05f * (dyn * dyn - vibrationLevel)
 
         if (armed && dyn > peakThresh) {
             val now = System.currentTimeMillis()

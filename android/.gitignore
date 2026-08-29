@@ -16,6 +16,16 @@
 /app/src/main/assets/models/*.tflite
 /app/src/main/assets/models/*.bin
 
+# --- On-device LLM / embedding weights — side-loaded, never committed (see src/llm|voicegate READMEs) ---
+*.task
+*.litertlm
+*.onnx
+*.onnx_data
+*.gguf
+*.safetensors
+/app/src/main/assets/llm/
+/app/src/main/assets/voicegate/*.onnx
+
 # --- Native runtime libs — NOT redistributed here ---
 #     Qualcomm QNN .so: from the Qualcomm AI Engine Direct SDK (see android/README.md).
 #     sherpa-onnx .so:  from https://github.com/k2-fsa/sherpa-onnx/releases (see app/src/sherpa/README.md).

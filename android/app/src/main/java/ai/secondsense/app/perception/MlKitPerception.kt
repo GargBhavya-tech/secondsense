@@ -106,6 +106,54 @@ class MlKitPerception(
             .addOnCompleteListener { bmp.recycle(); textBusy.set(false) }
     }
 
+    /**
+     * One-shot, on-demand OCR for a spoken "read this" (Phase 3 voice intent). Runs BOTH
+     * script recognizers on [frame] once, ignores the [offer] throttle / cooldown / dedupe
+     * entirely, and reports the longer of the two center-of-frame results (or null / blank when
+     * neither finds text). [onResult] fires on the ML Kit callback thread. [frame] is recycled
+     * here — pass a copy you no longer need.
+     */
+    fun readNow(frame: Bitmap, onResult: (text: String?, isDevanagari: Boolean) -> Unit) {
+        if (frame.isRecycled) { onResult(null, false); return }
+        val w = frame.width
+        val h = frame.height
+        val results = arrayOfNulls<String>(2)
+        val done = java.util.concurrent.atomic.AtomicInteger(0)
+
+        fun finish() {
+            if (done.incrementAndGet() < 2) return
+            runCatching { frame.recycle() }
+            val latin = results[0].orEmpty()
+            val deva = results[1].orEmpty()
+            when {
+                deva.length > latin.length && deva.isNotBlank() -> onResult(deva, true)
+                latin.isNotBlank() -> onResult(latin, false)
+                else -> onResult(null, false)
+            }
+        }
+
+        fun scan(client: TextRecognizer, slot: Int) {
+            client.process(InputImage.fromBitmap(frame, 0))
+                .addOnSuccessListener { r ->
+                    val sb = StringBuilder()
+                    for (block in r.textBlocks) {
+                        val bb = block.boundingBox ?: continue
+                        val cx = bb.centerX().toFloat() / w
+                        val cy = bb.centerY().toFloat() / h
+                        if (cx in 0.15f..0.85f && cy in 0.08f..0.92f) {
+                            if (sb.isNotEmpty()) sb.append(" - ")
+                            sb.append(block.text.replace('\n', ' ').trim())
+                        }
+                    }
+                    results[slot] = sb.toString().trim()
+                }
+                .addOnFailureListener { Log.w(TAG, "readNow slot$slot: ${it.message}") }
+                .addOnCompleteListener { finish() }
+        }
+        scan(textClientLatin, 0)
+        scan(textClientDevanagari, 1)
+    }
+
     private fun runFace(bmp: Bitmap, w: Int, h: Int) {
         faceClient.process(InputImage.fromBitmap(bmp, 0))
             .addOnSuccessListener { faces ->

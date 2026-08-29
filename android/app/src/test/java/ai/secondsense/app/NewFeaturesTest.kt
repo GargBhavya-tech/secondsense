@@ -16,12 +16,24 @@ import ai.secondsense.app.inference.decode.RestingStateVerifier
 import ai.secondsense.app.memory.DeadReckoner
 import ai.secondsense.app.memory.MemoryPhrase
 import ai.secondsense.app.memory.ObjectMemory
+import ai.secondsense.app.context.AppContext
+import ai.secondsense.app.context.ContextAutoDetector
+import ai.secondsense.app.context.ContextManager
+import ai.secondsense.app.context.ContextProfile
+import ai.secondsense.app.voice.IntentInterpreter
+import ai.secondsense.app.voice.LlmPrompt
+import ai.secondsense.app.voice.LlmResolution
+import ai.secondsense.app.voice.SafetyAnchors
+import ai.secondsense.app.voice.SafetyGate
+import ai.secondsense.app.voice.SceneBrief
+import ai.secondsense.app.voice.VoiceIntent
 import ai.secondsense.app.perf.PerfPolicy
 import ai.secondsense.app.perf.ThermalTier
 import ai.secondsense.app.sonification.CueTarget
 import ai.secondsense.app.sonification.ObstacleHabituation
 import ai.secondsense.app.voice.SceneNarrator
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -357,5 +369,405 @@ class SpecularCoplanarVetoTest {
             HazardState.SAFE,
             HazardFusion.classifySingleFrame(ev(0.7f, DepthVerdict.CONTRADICTS, coplanar = 0.85f)),
         )
+    }
+}
+
+/** Activity contexts: profiles get quieter as the user gets less active; transit kills hazard. */
+class ContextProfileTest {
+    @Test fun walkingIsFullSittingIsQuiet() {
+        val w = ContextProfile.profileFor(AppContext.WALKING)
+        assertTrue(w.sonification && w.hazardEnabled)
+        val s = ContextProfile.profileFor(AppContext.SITTING)
+        assertTrue(!s.sonification && !s.hazardEnabled && s.auxPerception)
+    }
+
+    @Test fun transitAndConversationDisableHazard() {
+        assertTrue(!ContextProfile.profileFor(AppContext.TRANSIT).hazardEnabled)
+        assertTrue(!ContextProfile.profileFor(AppContext.CONVERSATION).hazardEnabled)
+    }
+
+    @Test fun detectCadenceRelaxesAsContextGetsLessActive() {
+        var prev = 0
+        for (c in listOf(AppContext.WALKING, AppContext.STANDING, AppContext.SITTING, AppContext.CONVERSATION)) {
+            val p = ContextProfile.profileFor(c)
+            assertTrue("$c detectEveryN should not decrease", p.detectEveryN >= prev)
+            prev = p.detectEveryN
+        }
+    }
+}
+
+/** ContextManager: user set is immediate + sticky; a sensor suggestion needs sustained agreement. */
+class ContextManagerTest {
+    @Test fun voiceSetIsImmediateAndStickyThenAutoResumes() {
+        val m = ContextManager(stickyMs = 1000, graceMs = 100)
+        var applied: AppContext? = null
+        m.onContext = { c, _ -> applied = c }
+        m.set(AppContext.SITTING, nowMs = 0)
+        assertEquals(AppContext.SITTING, m.context)
+        assertEquals(AppContext.SITTING, applied)
+        m.suggest(AppContext.WALKING, nowMs = 200)
+        m.suggest(AppContext.WALKING, nowMs = 500)
+        assertEquals("suggestions ignored while sticky", AppContext.SITTING, m.context)
+        m.suggest(AppContext.WALKING, nowMs = 1100)
+        m.suggest(AppContext.WALKING, nowMs = 1250)
+        assertEquals("resumes after sticky + grace", AppContext.WALKING, m.context)
+    }
+
+    @Test fun suggestionNeedsGraceOfAgreement() {
+        val m = ContextManager(stickyMs = 0, graceMs = 500)
+        m.suggest(AppContext.SITTING, 0)
+        assertEquals(AppContext.WALKING, m.context)
+        m.suggest(AppContext.SITTING, 600)
+        assertEquals(AppContext.SITTING, m.context)
+    }
+}
+
+/** ContextAutoDetector.classify: motion signals -> a context guess (or null when ambiguous). */
+class ContextAutoDetectorTest {
+    private val d = ContextAutoDetector(
+        manager = ContextManager(),
+        walkingSupplier = { false },
+        vibrationSupplier = { 0f },
+        vehicleVibration = 0.22f,
+        vehicleSettleMs = 4_000L,
+    )
+
+    @Test fun stepsMeanWalkingRegardlessOfVibration() {
+        assertEquals(AppContext.WALKING, d.classify(walking = true, vibration = 0f, msSinceWalking = 0))
+        assertEquals(AppContext.WALKING, d.classify(walking = true, vibration = 5f, msSinceWalking = 0))
+    }
+
+    @Test fun rightAfterWalkingIsAmbiguous() {
+        // step energy still decaying — don't guess, leave the context alone
+        assertEquals(null, d.classify(walking = false, vibration = 5f, msSinceWalking = 1_000))
+    }
+
+    @Test fun sustainedVibrationWithoutStepsIsTransit() {
+        assertEquals(AppContext.TRANSIT, d.classify(walking = false, vibration = 0.5f, msSinceWalking = 10_000))
+    }
+
+    @Test fun stillAndQuietIsStanding() {
+        assertEquals(AppContext.STANDING, d.classify(walking = false, vibration = 0.03f, msSinceWalking = 10_000))
+    }
+}
+
+/** IntentInterpreter: free-form transcript -> one action from the closed set. */
+class IntentInterpreterTest {
+    private fun i(s: String, ctx: AppContext = AppContext.WALKING) = IntentInterpreter.interpret(s, ctx)
+
+    @Test fun findVerbAndBareNoun() {
+        assertEquals(VoiceIntent.Find("keys"), i("find my keys"))
+        assertEquals(VoiceIntent.Find("door"), i("take me to the door"))
+        assertEquals(VoiceIntent.Find("exit"), i("where's the exit"))
+        // bare noun only in a navigating context
+        assertEquals(VoiceIntent.Find("chair"), i("chair", AppContext.STANDING))
+        assertTrue(i("chair", AppContext.CONVERSATION) is VoiceIntent.Unknown)
+    }
+
+    @Test fun recallVsFindVsStatus() {
+        assertEquals(VoiceIntent.Recall("phone"), i("where did I leave my phone"))
+        assertEquals(VoiceIntent.Recall("wallet"), i("where is my wallet last seen"))
+        assertEquals(VoiceIntent.Status, i("where am I"))
+        assertEquals(VoiceIntent.Status, i("what mode am I in"))
+    }
+
+    @Test fun safetyFamiliesTakeTheFastPath() {
+        // Whole semantic families, not a phrase list. Anything that still slips past is caught
+        // downstream by the LLM deflect-flag + green-light veto — this is an optimisation.
+        assertEquals(VoiceIntent.SafetyCheck, i("is it safe to cross"))
+        assertEquals(VoiceIntent.SafetyCheck, i("is it okay to cross"))
+        assertEquals(VoiceIntent.SafetyCheck, i("can I walk"))          // was mis-parsed as Find("walk")
+        assertEquals(VoiceIntent.SafetyCheck, i("can I go now"))
+        assertEquals(VoiceIntent.SafetyCheck, i("should I move"))
+        assertEquals(VoiceIntent.SafetyCheck, i("is anything in my way"))
+        assertEquals(VoiceIntent.SafetyCheck, i("are there any obstacles ahead"))
+        assertEquals(VoiceIntent.SafetyCheck, i("is the path clear"))
+        assertEquals(VoiceIntent.SafetyCheck, i("is it safe"))
+    }
+
+    @Test fun moveVerbsAreNeverFindTargets() {
+        assertTrue(i("walk", AppContext.WALKING) !is VoiceIntent.Find)
+        assertTrue(i("go", AppContext.WALKING) !is VoiceIntent.Find)
+    }
+
+    /**
+     * Broad demo sweep: every phrase a judge might try, mapped to the family it MUST land in.
+     * Fails with a full report of every misroute so they can all be fixed at once.
+     */
+    @Test fun demoPhraseSweep() {
+        fun kind(v: VoiceIntent): String = when (v) {
+            is VoiceIntent.Find -> "Find"
+            is VoiceIntent.Recall -> "Recall"
+            VoiceIntent.Describe -> "Describe"
+            VoiceIntent.SafetyCheck -> "SafetyCheck"
+            VoiceIntent.ReadText -> "ReadText"
+            VoiceIntent.Status -> "Status"
+            VoiceIntent.RepeatLast -> "RepeatLast"
+            is VoiceIntent.Cues -> "Cues"
+            VoiceIntent.Pause -> "Pause"
+            VoiceIntent.Resume -> "Resume"
+            VoiceIntent.CancelSeek -> "CancelSeek"
+            VoiceIntent.Help -> "Help"
+            is VoiceIntent.CallContact -> "CallContact"
+            is VoiceIntent.SetTimer -> "SetTimer"
+            is VoiceIntent.SetLanguage -> "SetLanguage"
+            is VoiceIntent.SwitchContext -> "SwitchContext"
+            is VoiceIntent.Unknown -> "Unknown"
+        }
+        // (phrase, acceptable kinds). Unknown is acceptable ONLY where the LLM is a fine fallback.
+        val cases = listOf(
+            // find
+            "find my keys" to setOf("Find"),
+            "find the exit" to setOf("Find"),
+            "where is the elevator" to setOf("Find"),
+            "where's the nearest chair" to setOf("Find"),
+            "take me to the door" to setOf("Find"),
+            "guide me to the stairs" to setOf("Find"),
+            "look for a trash can" to setOf("Find"),
+            "i'm looking for my phone" to setOf("Find"),
+            "locate the bench" to setOf("Find"),
+            "i need the bathroom" to setOf("Find"),
+            // recall
+            "where did i leave my wallet" to setOf("Recall"),
+            "where did i put my cup" to setOf("Recall"),
+            "where's my bag" to setOf("Recall", "Find"),
+            // describe
+            "what's ahead" to setOf("Describe"),
+            "what is around me" to setOf("Describe"),
+            "describe the scene" to setOf("Describe"),
+            "what do you see" to setOf("Describe"),
+            "what's in front of me" to setOf("Describe"),
+            "look around" to setOf("Describe"),
+            "tell me what's there" to setOf("Describe", "Unknown"),
+            // read
+            "read this" to setOf("ReadText"),
+            "read the sign" to setOf("ReadText"),
+            "what does it say" to setOf("ReadText"),
+            "read that label" to setOf("ReadText"),
+            "what's written there" to setOf("ReadText"),
+            "read out the menu" to setOf("ReadText"),
+            // safety
+            "is it safe to cross" to setOf("SafetyCheck"),
+            "is it safe to cross the road" to setOf("SafetyCheck"),
+            "can i walk" to setOf("SafetyCheck"),
+            "can i go now" to setOf("SafetyCheck"),
+            "should i cross" to setOf("SafetyCheck"),
+            "is the path clear" to setOf("SafetyCheck"),
+            "is the way ahead clear" to setOf("SafetyCheck"),
+            "is anything in my way" to setOf("SafetyCheck"),
+            "are there obstacles ahead" to setOf("SafetyCheck"),
+            "is it clear to go" to setOf("SafetyCheck"),
+            "am i safe to move" to setOf("SafetyCheck"),
+            // status
+            "status" to setOf("Status"),
+            "how am i doing" to setOf("Status"),
+            "where am i" to setOf("Status"),
+            "what's my battery" to setOf("Status"),
+            "what mode am i in" to setOf("Status"),
+            "give me a status report" to setOf("Status"),
+            // repeat
+            "repeat" to setOf("RepeatLast"),
+            "say that again" to setOf("RepeatLast"),
+            "what did you say" to setOf("RepeatLast"),
+            "come again" to setOf("RepeatLast"),
+            // cues
+            "stop the beeping" to setOf("Cues"),
+            "mute" to setOf("Cues"),
+            "be quiet" to setOf("Cues"),
+            "turn off the sound" to setOf("Cues"),
+            "turn on cues" to setOf("Cues"),
+            "start the cues" to setOf("Cues"),
+            // pause / resume
+            "pause" to setOf("Pause"),
+            "hold on" to setOf("Pause"),
+            "resume" to setOf("Resume"),
+            "carry on" to setOf("Resume"),
+            // cancel
+            "never mind" to setOf("CancelSeek"),
+            "cancel" to setOf("CancelSeek"),
+            "stop looking" to setOf("CancelSeek"),
+            "forget it" to setOf("CancelSeek"),
+            // context
+            "i'm sitting down" to setOf("SwitchContext"),
+            "getting on the bus" to setOf("SwitchContext"),
+            "let's start walking" to setOf("SwitchContext"),
+            "i'm at home now" to setOf("SwitchContext"),
+            "i've stopped" to setOf("SwitchContext"),
+            "conversation mode" to setOf("SwitchContext"),
+            // language
+            "speak hindi" to setOf("SetLanguage"),
+            "switch to english" to setOf("SetLanguage"),
+            "talk in hindi please" to setOf("SetLanguage"),
+            // phone
+            "call mom" to setOf("CallContact"),
+            "phone dad" to setOf("CallContact"),
+            "call my wife" to setOf("CallContact"),
+            "set a timer for five minutes" to setOf("SetTimer"),
+            "timer for 30 seconds" to setOf("SetTimer"),
+            "set a ten minute timer" to setOf("SetTimer"),
+            // help
+            "help" to setOf("Help"),
+            "what can i say" to setOf("Help"),
+            "what can you do" to setOf("Help"),
+        )
+        val misroutes = cases.mapNotNull { (phrase, ok) ->
+            val got = kind(IntentInterpreter.interpret(phrase, AppContext.WALKING))
+            if (got in ok) null else "  \"$phrase\"  ->  $got   (want ${ok.joinToString("/")})"
+        }
+        assertTrue(
+            "\n${misroutes.size} misrouted demo phrases:\n${misroutes.joinToString("\n")}\n",
+            misroutes.isEmpty(),
+        )
+    }
+
+    @Test fun describeAndRead() {
+        assertEquals(VoiceIntent.Describe, i("what's ahead"))
+        assertEquals(VoiceIntent.Describe, i("describe the scene please"))
+        assertEquals(VoiceIntent.ReadText, i("read this"))
+        assertEquals(VoiceIntent.ReadText, i("what does the sign say"))
+    }
+
+    @Test fun controlVerbs() {
+        assertEquals(VoiceIntent.Cues(on = false), i("stop the beeping"))
+        assertEquals(VoiceIntent.Cues(on = false), i("mute"))
+        assertEquals(VoiceIntent.Cues(on = true), i("turn on cues"))
+        assertEquals(VoiceIntent.Pause, i("pause"))
+        assertEquals(VoiceIntent.Resume, i("resume"))
+        assertEquals(VoiceIntent.RepeatLast, i("say that again"))
+        assertEquals(VoiceIntent.Help, i("what can I say"))
+        assertEquals(VoiceIntent.CancelSeek, i("never mind"))
+    }
+
+    @Test fun contextSwitchPhrases() {
+        assertEquals(VoiceIntent.SwitchContext(AppContext.SITTING), i("I'm sitting down now"))
+        assertEquals(VoiceIntent.SwitchContext(AppContext.TRANSIT), i("just getting on the bus"))
+        assertEquals(VoiceIntent.SwitchContext(AppContext.WALKING), i("okay let's walk"))
+    }
+
+    @Test fun gibberishIsUnknown() {
+        // no seek verb + too long for the bare-noun fallback
+        assertTrue(i("the weather today is quite nice outside") is VoiceIntent.Unknown)
+        // short, but a non-navigating context disables the bare-noun fallback
+        assertTrue(i("banana helicopter", AppContext.CONVERSATION) is VoiceIntent.Unknown)
+        assertTrue(i("") is VoiceIntent.Unknown)
+    }
+
+    @Test fun languageSwitch() {
+        assertEquals(VoiceIntent.SetLanguage(true), i("speak hindi"))
+        assertEquals(VoiceIntent.SetLanguage(true), i("switch to hindi please"))
+        assertEquals(VoiceIntent.SetLanguage(false), i("talk in english"))
+        // a bare mention with no language cue must NOT flip the language
+        assertTrue(i("find the hindi newspaper", AppContext.WALKING) is VoiceIntent.Find)
+    }
+
+    @Test fun phoneTasks() {
+        assertEquals(VoiceIntent.CallContact("mom"), i("call mom"))
+        assertEquals(VoiceIntent.CallContact("dr smith"), i("phone dr smith"))
+        assertEquals(VoiceIntent.SetTimer(300), i("set a timer for five minutes"))
+        assertEquals(VoiceIntent.SetTimer(90), i("timer 90 seconds"))
+        assertEquals(VoiceIntent.SetTimer(3600), i("set a timer for an hour"))
+    }
+}
+
+/** LlmPrompt.parse: lenient JSON -> resolution; prompt build stays grounded. */
+class LlmPromptTest {
+    private val scene = SceneBrief(
+        context = "walking", objectsAhead = listOf("door ahead"), hazard = null,
+        batteryPct = 82, camera = "ok", lastSpoken = "Looking for door.",
+    )
+
+    @Test fun mapsJsonActionsToIntents() {
+        assertEquals(
+            LlmResolution.Action(VoiceIntent.Find("elevator")),
+            LlmPrompt.parse("""{"action":"find","target":"elevator"}"""),
+        )
+        assertEquals(
+            LlmResolution.Action(VoiceIntent.SwitchContext(AppContext.TRANSIT)),
+            LlmPrompt.parse("""{"action":"context","context":"transit"}"""),
+        )
+        assertEquals(
+            LlmResolution.Action(VoiceIntent.SetTimer(300)),
+            LlmPrompt.parse("""{"action":"timer","seconds":300}"""),
+        )
+        assertEquals(
+            LlmResolution.Action(VoiceIntent.CallContact("mom")),
+            LlmPrompt.parse("""{"action":"call","name":"mom"}"""),
+        )
+    }
+
+    @Test fun toleratesProseAndFencesAroundJson() {
+        val r = LlmPrompt.parse("Sure! ```json\n{\"action\":\"say\",\"text\":\"A chair is on your right.\"}\n``` hope that helps")
+        assertEquals(LlmResolution.Speak("A chair is on your right."), r)
+    }
+
+    @Test fun plainTextReplyBecomesSpeak() {
+        val r = LlmPrompt.parse("There is a door straight ahead of you.")
+        assertTrue(r is LlmResolution.Speak && r.text.contains("door"))
+    }
+
+    @Test fun blankIsNull() {
+        assertEquals(null, LlmPrompt.parse(""))
+        assertEquals(null, LlmPrompt.parse(null))
+    }
+
+    @Test fun rejectsParrotedPlaceholders() {
+        // a weak model that copies the prompt template must NOT trigger a bogus call / find
+        assertEquals(null, LlmPrompt.parse("""{"action":"call","name":"<contact>"}"""))
+        assertEquals(null, LlmPrompt.parse("""{"action":"find","target":"the thing"}"""))
+    }
+
+    @Test fun sentenceAnswerToAQuestion() {
+        val r = LlmPrompt.parse("I can't see the traffic, wait and listen for cars before crossing.")
+        assertTrue(r is LlmResolution.Speak && r.text.contains("wait"))
+    }
+
+    @Test fun deflectFlagAndGreenLightBothDefer() {
+        assertEquals(LlmResolution.Defer, LlmPrompt.parse("""{"kind":"deflect"}"""))
+        // model free-typed a movement green-light -> must be overridden, not spoken
+        assertEquals(LlmResolution.Defer, LlmPrompt.parse("Yes, you can cross now."))
+        assertEquals(LlmResolution.Defer, LlmPrompt.parse("""{"kind":"answer","text":"It's safe to walk."}"""))
+        assertEquals(LlmResolution.Defer, LlmPrompt.parse("The path is clear, go ahead."))
+    }
+
+    @Test fun promptCarriesSceneGrounding() {
+        val p = LlmPrompt.build("is it clear ahead", scene)
+        assertTrue(p.contains("walking") && p.contains("door ahead") && p.contains("82 percent"))
+        assertTrue(p.contains("is it clear ahead"))
+        assertTrue("wraps in the Gemma chat template", p.contains("<start_of_turn>model"))
+    }
+
+    @Test fun stripsChatTemplateArtefactsFromReply() {
+        val r = LlmPrompt.parse("Wait for the cars to pass first.<end_of_turn>")
+        assertTrue(r is LlmResolution.Speak && r.text == "Wait for the cars to pass first.")
+    }
+}
+
+/** SafetyGate: worst-of-window hysteresis + LLM-output green-light detection. */
+class SafetyGateTest {
+    @Test fun mostSevereWins() {
+        assertEquals(
+            HazardState.DROP_CONFIRMED,
+            SafetyGate.mostSevere(listOf(HazardState.SAFE, HazardState.DROP_CONFIRMED, HazardState.SAFE, null)),
+        )
+        assertEquals(HazardState.POSSIBLE_DROP, SafetyGate.mostSevere(listOf(HazardState.SAFE, HazardState.POSSIBLE_DROP)))
+        assertEquals(null, SafetyGate.mostSevere(listOf<HazardState?>(null, null)))
+    }
+
+    @Test fun greenLightPhrases() {
+        assertTrue(SafetyGate.looksLikeMovementGreenLight("Yes, you can walk."))
+        assertTrue(SafetyGate.looksLikeMovementGreenLight("It's safe to cross."))
+        assertTrue(SafetyGate.looksLikeMovementGreenLight("The road is clear, go ahead."))
+        assertTrue(SafetyGate.looksLikeMovementGreenLight("You're good, you're safe."))
+        assertFalse(SafetyGate.looksLikeMovementGreenLight("There is a chair on your right."))
+        assertFalse(SafetyGate.looksLikeMovementGreenLight("I cannot judge that, use your cane."))
+        assertFalse(SafetyGate.looksLikeMovementGreenLight(""))
+    }
+
+    @Test fun anchorsAreCuratedAndMultilingual() {
+        assertTrue("enough anchors for a smooth boundary", SafetyAnchors.PHRASES.size >= 40)
+        assertTrue("has Devanagari", SafetyAnchors.PHRASES.any { it.any { c -> c.code in 0x0900..0x097F } })
+        assertTrue("has Kannada", SafetyAnchors.PHRASES.any { it.any { c -> c.code in 0x0C80..0x0CFF } })
+        assertTrue("no blanks / dupes", SafetyAnchors.PHRASES.none { it.isBlank() } &&
+            SafetyAnchors.PHRASES.size == SafetyAnchors.PHRASES.distinct().size)
     }
 }

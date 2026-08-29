@@ -295,7 +295,7 @@ class TfliteInferenceEngine(
     }
 
     override fun setDepthEveryN(n: Int) { depthEveryN = n.coerceIn(1, 12) }
-    override fun setHazardEveryN(n: Int) { sceneAnalyzer.hazardEveryN = n.coerceIn(1, 12) }
+    override fun setHazardEveryN(n: Int) { sceneAnalyzer.hazardEveryN = n.coerceIn(0, 12) }
 
     // ---- helpers -----------------------------------------------------------
 

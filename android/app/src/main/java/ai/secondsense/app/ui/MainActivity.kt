@@ -34,6 +34,9 @@ import ai.secondsense.app.memory.ObjectMemory
 import ai.secondsense.app.sensors.PedometerTracker
 import ai.secondsense.app.perf.PerfPolicy
 import ai.secondsense.app.perf.ThermalGovernor
+import ai.secondsense.app.context.AppContext
+import ai.secondsense.app.context.ContextAutoDetector
+import ai.secondsense.app.context.ContextManager
 import ai.secondsense.app.sonification.CueTarget
 import ai.secondsense.app.sonification.ObstacleHabituation
 import java.util.Locale
@@ -62,6 +65,16 @@ import ai.secondsense.app.voice.GoalGrounding
 import ai.secondsense.app.voice.OwlVitQnnGrounder
 import ai.secondsense.app.voice.SpeechRecognizer
 import ai.secondsense.app.voice.VectorToGoalController
+import ai.secondsense.app.voice.IntentInterpreter
+import ai.secondsense.app.voice.LlmAssistant
+import ai.secondsense.app.voice.LlmAssistants
+import ai.secondsense.app.voice.LlmResolution
+import ai.secondsense.app.voice.PhoneActions
+import ai.secondsense.app.voice.SafetyGate
+import ai.secondsense.app.voice.SafetyVectorGate
+import ai.secondsense.app.voice.SafetyVectorGates
+import ai.secondsense.app.voice.SceneBrief
+import ai.secondsense.app.voice.VoiceIntent
 import ai.secondsense.app.voice.VoiceCommandCapture
 import ai.secondsense.app.voice.VoiceRecognizers
 import ai.secondsense.app.voice.WhisperQnnRecognizer
@@ -117,6 +130,15 @@ class MainActivity : AppCompatActivity() {
     private val grounder = OwlVitQnnGrounder(voiceBackend)
     private val vectorToGoal = VectorToGoalController()                   // #28
     private val voiceCapture by lazy { VoiceCommandCapture(speechRecognizer) }
+    // Phase 4 — on-device LLM fallback for anything the IntentInterpreter grammar can't place.
+    // Stub unless built with -PenableLlm=true AND a model file is side-loaded (see
+    // MediaPipeLlmAssistant); every call is a safe no-op otherwise.
+    private val llm: LlmAssistant by lazy { LlmAssistants.create(this) }
+    @Volatile private var pendingCallName: String? = null
+    // Tier-2 safety gate: multilingual-e5 embedding classifier. Noop until the model ships;
+    // when ready it intercepts safety/movement questions in ANY phrasing/language before the
+    // grammar or the LLM see them.
+    private val safetyVectorGate: SafetyVectorGate by lazy { SafetyVectorGates.create(this) }
 
     // Dedicated single thread for CameraX analysis callbacks.
     private val analysisExecutor = Executors.newSingleThreadExecutor()
@@ -131,6 +153,11 @@ class MainActivity : AppCompatActivity() {
     // on-device false positive (desk+keyboard scene fired BOTH V2 and V3 independently — see
     // HazardFusion.kt's revision notes). V3's hazardState is now the only drop-off signal.
     @Volatile private var lastHazardState: ai.secondsense.app.inference.decode.HazardState? = null
+    // Rolling ~1.5 s window of fused hazard states — the safety gate answers "is it clear" from
+    // the WORST state in this window, so a drop-off that flickered mid-question still counts
+    // (temporal hysteresis, deep-research layer 1).
+    private val hazardWindow = ArrayDeque<Pair<Long, ai.secondsense.app.inference.decode.HazardState?>>()
+    private val HAZARD_WINDOW_MS = 1_500L
 
     // Accuracy: multi-frame detection-confidence stabilization (no model change).
     private val stabilizer = DetectionStabilizer()
@@ -144,6 +171,8 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var lastOverhead = false
     // Double-tap "what's around me" scene description.
     @Volatile private var lastResult: FrameResult? = null
+    // Most recent upright frame, stashed unconditionally for the "read this" voice intent.
+    @Volatile private var lastFrameForOcr: android.graphics.Bitmap? = null
     private var tts: TextToSpeech? = null
     @Volatile private var ttsReady = false
     private var sceneGestures: GestureDetector? = null
@@ -179,12 +208,29 @@ class MainActivity : AppCompatActivity() {
     private val deadReckoner = DeadReckoner()
     private val objectMemory = ObjectMemory()
     @Volatile private var memoryNavActive = false
+    // "find X" demo safety-net: when the goal was set, and whether it's ever been seen.
+    @Volatile private var goalSetAtMs = 0L
+    @Volatile private var goalEverSeen = false
 
     // Problem Statement 6 — thermal throttling / deterministic latency in the closed harness.
     private val thermalGovernor by lazy { ThermalGovernor(walkingSupplier = { pedometer.isWalking }) }
     @Volatile private var perceptionEnabled = true
     @Volatile private var yamnetWanted = true
     @Volatile private var lowResActive = false
+
+    // Activity context (Walking/Standing/Sitting/Home/Transit/Conversation) — reconfigures the
+    // whole pipeline; merged with the thermal policy in applyEffectivePolicy().
+    private val contextManager = ContextManager()
+    // Phase 2: infers Walking/Standing/Transit from step cadence + accel vibration and feeds
+    // contextManager.suggest() (15 s grace, yields to anything the user set). Permission-free.
+    private val contextAutoDetector by lazy {
+        ContextAutoDetector(
+            manager = contextManager,
+            walkingSupplier = { pedometer.isWalking },
+            vibrationSupplier = { pedometer.vibrationLevel },
+        )
+    }
+    private var lastFloorMs = 0L
 
     private fun currentPose(): DeadReckoner.Pose =
         deadReckoner.pose(EngineConfig.imuTracker?.headingDeg ?: 0f)
@@ -282,6 +328,16 @@ class MainActivity : AppCompatActivity() {
             } else Toast.makeText(this, "Mic permission is required for voice search", Toast.LENGTH_LONG).show()
         }
 
+    // Phase 4 "call <contact>" — CALL_PHONE + READ_CONTACTS, requested only the first time the
+    // user actually asks to call someone. On grant, retry the call we stashed.
+    private val requestCallPerms =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+            val name = pendingCallName ?: return@registerForActivityResult
+            pendingCallName = null
+            if (result.values.all { it }) announce(PhoneActions.call(this, name))
+            else announce("I don't have permission to make calls.")
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -321,12 +377,26 @@ class MainActivity : AppCompatActivity() {
             } catch (t: Throwable) {
                 android.util.Log.w("SecondSense/voice", "speechRecognizer.initialize() failed", t)
             }
+            // Phase 4 LLM: heavy (~seconds) model load; no-op stub unless -PenableLlm + model file.
+            try {
+                llm.initialize()
+            } catch (t: Throwable) {
+                android.util.Log.w("SecondSense/llm", "llm.initialize() failed", t)
+            }
+            try {
+                safetyVectorGate.initialize()
+            } catch (t: Throwable) {
+                android.util.Log.w("SecondSense/llm", "safetyVectorGate.initialize() failed", t)
+            }
         }
 
         analyzer = FrameAnalyzer(
             engine,
             onResult = { result -> onFrameResult(result) },
-            frameSink = { bmp -> if (perceptionEnabled) perception.offer(bmp) },
+            frameSink = { bmp ->
+                lastFrameForOcr = bmp   // kept for a one-shot "read this" even when aux OCR is off
+                if (perceptionEnabled) perception.offer(bmp)
+            },
         )
 
         // --- #6 done-condition: test tone + test buzz on tap ---
@@ -416,11 +486,14 @@ class MainActivity : AppCompatActivity() {
             deadReckoner.onStep(EngineConfig.imuTracker?.headingDeg ?: 0f, pedometer.strideMeters)
         }
 
-        // Thermal governor — turns cadences/resolution/aux load down as the harness heats up.
-        thermalGovernor.onPolicy = { p -> runOnUiThread { applyPerfPolicy(p) } }
+        // Thermal governor + activity context both feed one merge point (most-conservative wins).
+        thermalGovernor.onPolicy = { runOnUiThread { applyEffectivePolicy() } }
         thermalGovernor.onNotice = { msg ->
             speakLocalized(msg, langPrefs.speakHindi, TextToSpeech.QUEUE_ADD, "thermal")
         }
+        contextManager.onContext = { _, _ -> runOnUiThread { applyEffectivePolicy() } }
+        contextManager.onAnnounce = { msg -> runOnUiThread { announce(msg); haptics.testBuzz() } }
+        applyEffectivePolicy()   // apply the default (WALKING) profile from the first frame
         // --- Blind-first gesture surface. dispatchTouchEvent (below) feeds this every touch
         // before any child view can eat it. Suppressed entirely when TalkBack is on (it drives
         // the visible fallback buttons instead) and while the spoken menu owns input. ---
@@ -433,18 +506,14 @@ class MainActivity : AppCompatActivity() {
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
                 if (surfaceInactive() || gMaxPointers >= 2) return false
                 if (menuOpen) return true
-                when ((e.y / rootH()).coerceIn(0f, 0.999f)) {
-                    in 0f..0.34f -> narrateScene()
-                    in 0.34f..0.67f -> announceStatus()
-                    else -> enterExploreAndListen()
-                }
+                tapToTalk()   // one tap anywhere = wake + listen (Phase 3)
                 return true
             }
 
             override fun onDoubleTap(e: MotionEvent): Boolean {
                 if (surfaceInactive() || gMaxPointers >= 2) return false
                 if (menuOpen) { menuActivate(); return true }
-                toggleSonify()
+                narrateScene()   // offline "what's ahead" — no mic, for noisy places
                 return true
             }
 
@@ -457,7 +526,8 @@ class MainActivity : AppCompatActivity() {
             override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
                 if (surfaceInactive()) return false
                 if (kotlin.math.abs(vy) < kotlin.math.abs(vx) || kotlin.math.abs(vy) < 900f) return false
-                if (menuOpen) { if (vy < 0) menuMove(-1) else menuMove(1) } else toggleWalkExplore()
+                if (menuOpen) { if (vy < 0) menuMove(-1) else menuMove(1) }
+                else contextManager.step(moreActive = vy < 0f, System.currentTimeMillis()) // up = more active
                 return true
             }
         })
@@ -469,7 +539,7 @@ class MainActivity : AppCompatActivity() {
         binding.talkbackHint.visibility = if (talkbackOn) View.GONE else View.VISIBLE
         binding.btnTbAround.setOnClickListener { narrateScene() }
         binding.btnTbStatus.setOnClickListener { announceStatus() }
-        binding.btnTbFind.setOnClickListener { enterExploreAndListen() }
+        binding.btnTbFind.setOnClickListener { tapToTalk() }
         binding.btnCloseAdmin.setOnClickListener { toggleAdmin() }
 
         updateBigStatus()
@@ -665,7 +735,16 @@ class MainActivity : AppCompatActivity() {
     /** Speak + remember, so Volume-Up can repeat it. */
     private fun announce(text: String) {
         lastAnnouncement = text
-        speakLocalized(text, langPrefs.speakHindi, TextToSpeech.QUEUE_FLUSH, "announce")
+        // When Hindi is the preference, actually translate the English UI line before speaking
+        // it — otherwise a hi-IN TTS voice just mangles English words. Falls back to the
+        // English string if the on-device model pair isn't downloaded.
+        if (langPrefs.speakHindi && langPrefs.translateSigns) {
+            translator.localize(text, sourceIsDevanagari = false, wantHindi = true, translateEnabled = true) { spoken, isHi ->
+                speakLocalized(spoken, isHi, TextToSpeech.QUEUE_FLUSH, "announce")
+            }
+        } else {
+            speakLocalized(text, langPrefs.speakHindi, TextToSpeech.QUEUE_FLUSH, "announce")
+        }
     }
 
     private fun repeatLast() = announce(lastAnnouncement ?: "Nothing to repeat.")
@@ -697,6 +776,21 @@ class MainActivity : AppCompatActivity() {
         if (hasMicPermission()) startVoiceCapture() else requestMic.launch(Manifest.permission.RECORD_AUDIO)
     }
 
+    /**
+     * Phase 3 primary gesture: one tap anywhere on the screen wakes the assistant. A short
+     * earcon + buzz confirm it's listening; the transcript is then routed through
+     * [IntentInterpreter] -> [handleVoiceIntent]. No mode change here — the intent decides
+     * (Find/Recall flip to Scan/Seek, everything else runs in place).
+     */
+    private fun tapToTalk() {
+        if (menuOpen) return
+        audio.testTone()
+        haptics.testBuzz()
+        announce("Listening.")
+        if (hasMicPermission()) startVoiceCapture()
+        else requestMic.launch(Manifest.permission.RECORD_AUDIO)
+    }
+
     private fun toggleAdmin() {
         val show = binding.adminPanel.visibility != View.VISIBLE
         binding.adminPanel.visibility = if (show) View.VISIBLE else View.GONE
@@ -704,8 +798,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun announceStatus() {
-        val mode = if (paused) "paused" else if (modeController.acceptsVoiceCommands) "explore" else "walking"
-        val cues = if (sonifying && !paused) "cues on" else "cues off"
+        val mode = if (paused) "paused" else contextManager.context.name.lowercase()
+        val cues = if (sonifying && !paused && contextManager.profile.sonification) "cues on" else "cues off"
         val cam = camHealthShort()
         val batt = batteryPercent()
         val seen = lastResult?.detections?.mapNotNull { it.label }?.distinct()?.take(3)
@@ -754,11 +848,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun speakHelp() {
         announce(
-            "Gestures. Tap the top of the screen for what is around you. Tap the middle for status. " +
-                "Tap the bottom to find something. Double tap for cues on or off. " +
-                "Two finger tap to pause or resume. Swipe up or down to switch walk and explore. " +
-                "Long press for the settings menu. Volume up repeats the last message. " +
-                "Volume down changes loudness.",
+            "One tap anywhere wakes me. After the beep, just say what you want. " +
+                "For example: find my keys. What's ahead. Read this. Where did I leave my phone. " +
+                "Status. I'm sitting. Stop the beeping. Speak Hindi. Or say repeat. " +
+                "Double tap for a quick look ahead without the microphone. " +
+                "Two finger tap to pause or resume. Three finger tap for this help. " +
+                "Swipe up or down to change mode. Long press for the settings menu. " +
+                "Volume up repeats the last message. Volume down changes loudness.",
         )
     }
 
@@ -771,10 +867,9 @@ class MainActivity : AppCompatActivity() {
             menuOpen -> "MENU"
             paused -> "PAUSED"
             goal != null -> "FINDING\n${goal.uppercase()}"
-            modeController.acceptsVoiceCommands -> "EXPLORE"
-            else -> "WALKING"
+            else -> contextManager.context.name   // WALKING / STANDING / SITTING / HOME / TRANSIT / CONVERSATION
         }
-        val cueStr = if (sonifying && !paused) "cues on" else "cues off"
+        val cueStr = if (sonifying && !paused && contextManager.profile.sonification) "cues on" else "cues off"
         val sub = "$cueStr · ${camHealthShort()} · batt ${batteryPercent()}%"
         runOnUiThread {
             binding.statusBig.text = big
@@ -788,6 +883,9 @@ class MainActivity : AppCompatActivity() {
 
     private val menuItems: List<MenuItem> by lazy {
         listOf(
+            MenuItem("Context", { contextManager.context.name.lowercase() }) {
+                contextManager.cycle(System.currentTimeMillis())
+            },
             MenuItem("Language", { if (langPrefs.speakHindi) "Hindi" else "English" }) {
                 binding.switchHindi.isChecked = !binding.switchHindi.isChecked
             },
@@ -854,25 +952,41 @@ class MainActivity : AppCompatActivity() {
         lastCamHealth = h
     }
 
-    /** Apply a [PerfPolicy] from the thermal governor — cadences, aux load, resolution. */
-    private fun applyPerfPolicy(p: PerfPolicy) {
-        analyzer.processEveryN = p.frameEveryN
-        engine.setDepthEveryN(p.depthEveryN)
-        engine.setHazardEveryN(p.hazardEveryN)
-        perceptionEnabled = p.auxEnabled
+    /**
+     * The single place every cadence/load knob is set — merges the THERMAL policy (harness
+     * heat) and the CONTEXT profile (what the user is doing). Most-conservative wins per knob:
+     * whichever says "slower / off" is applied. Called on any thermal or context change.
+     */
+    private fun applyEffectivePolicy() {
+        val t = thermalGovernor.policy
+        val c = contextManager.profile
 
-        if (p.yamnetEnabled != yamnetWanted) {
-            yamnetWanted = p.yamnetEnabled
-            if (yamnetWanted) { if (hasMicPermission()) startHazardDetection() } else hazardDetector.stop()
+        analyzer.processEveryN = maxOf(t.frameEveryN, c.detectEveryN)
+        engine.setDepthEveryN(maxOf(t.depthEveryN, c.depthEveryN))
+        engine.setHazardEveryN(if (!c.hazardEnabled) 0 else maxOf(t.hazardEveryN, 1))
+        perceptionEnabled = t.auxEnabled && c.auxPerception
+
+        val wantYamnet = t.yamnetEnabled && c.auxPerception
+        if (wantYamnet != yamnetWanted) {
+            yamnetWanted = wantYamnet
+            if (wantYamnet) { if (hasMicPermission()) startHazardDetection() } else hazardDetector.stop()
         }
-        if (p.lowRes != lowResActive) {
-            lowResActive = p.lowRes
-            if (hasCameraPermission()) startCamera()   // rebinds ImageAnalysis at the new size
+        if (t.lowRes != lowResActive) {
+            lowResActive = t.lowRes
+            if (hasCameraPermission()) startCamera()
         }
+        // The context can mute the continuous OBSTACLE cue loop — but an explicit spoken goal
+        // ("find my chair") must still steer, whatever the activity context. A live voice /
+        // memory goal keeps the cue engine running.
+        val voiceGoalLive = vectorToGoal.isActive || memoryNavActive
+        val cuesLive = (c.sonification || voiceGoalLive) && sonifying && !paused
+        if (!cuesLive) { cueEngine.stop(); cueEngine.update(null) } else cueEngine.start()
+
+        updateBigStatus()
         android.util.Log.i(
-            "SecondSense/thermal",
-            "applied ${p.label}: frame/${p.frameEveryN} depth/${p.depthEveryN} hazard/${p.hazardEveryN} " +
-                "aux=${p.auxEnabled} yamnet=${p.yamnetEnabled} lowRes=${p.lowRes}",
+            "SecondSense/context",
+            "effective ctx=${c.label} thermal=${t.label}: frame/${analyzer.processEveryN} " +
+                "depth+ hazard=${c.hazardEnabled} aux=$perceptionEnabled cues=$cuesLive",
         )
     }
 
@@ -898,28 +1012,229 @@ class MainActivity : AppCompatActivity() {
         // on the same source (this capture) fails on many devices. Pause hazard listening for
         // the short capture window, then restart it.
         hazardDetector.stop()
-        voiceCapture.capture { noun, transcript, recognizerReady ->
+        voiceCapture.capture { _, transcript, recognizerReady ->
             if (hasMicPermission()) startHazardDetection()
-            // "where is my X" / "where's my X" -> recall from memory; anything else -> live seek.
-            val isRecall = transcript?.lowercase()?.let {
-                it.contains("where") || it.contains("last seen") || it.contains("did i leave")
-            } == true
-            runOnUiThread {
-                when {
-                    !recognizerReady -> Toast.makeText(
-                        this,
-                        "Voice model not loaded — build with -PenableSherpa + add the KWS model (see android/app/src/sherpa/README.md)",
-                        Toast.LENGTH_LONG,
-                    ).show()
-                    noun == null -> Toast.makeText(this, "Didn't catch a target", Toast.LENGTH_SHORT).show()
-                    isRecall -> recallObject(noun)
-                    else -> {
-                        vectorToGoal.setGoal(noun)
-                        memoryNavActive = false
-                        binding.switchSonify.isChecked = true   // ensure the cue loop is running to steer
-                        Toast.makeText(this, "Goal set: $noun", Toast.LENGTH_SHORT).show()
-                    }
+            // Tier-2 safety gate FIRST: a semantic classifier catches "is it safe / can I move"
+            // in any phrasing or language and forces the deterministic deflection, bypassing
+            // both the grammar and the LLM. Noop until the embedding model ships.
+            if (recognizerReady && !transcript.isNullOrBlank() &&
+                safetyVectorGate.isReady() && safetyVectorGate.isSafetyQuery(transcript)
+            ) {
+                android.util.Log.i("SecondSense/voice", "heard=\"$transcript\" -> [vector-gate] SafetyCheck")
+                runOnUiThread { handleVoiceIntent(VoiceIntent.SafetyCheck, true) }
+                return@capture
+            }
+            // Phase 3: the whole transcript -> one action from a closed set (offline rule grammar).
+            // Whatever the grammar can't place becomes VoiceIntent.Unknown -> Phase 4 LLM.
+            val intent = IntentInterpreter.interpret(transcript, contextManager.context)
+            android.util.Log.i("SecondSense/voice", "heard=\"$transcript\" -> $intent")
+            runOnUiThread { handleVoiceIntent(intent, recognizerReady) }
+        }
+    }
+
+    /** Execute one interpreted [VoiceIntent] against the existing handlers. */
+    private fun handleVoiceIntent(intent: VoiceIntent, recognizerReady: Boolean) {
+        if (!recognizerReady && intent !is VoiceIntent.Help) {
+            Toast.makeText(
+                this,
+                "Voice model not loaded — build with -PenableSherpa + add the KWS model (see android/app/src/sherpa/README.md)",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+        when (intent) {
+            is VoiceIntent.Find -> {
+                modeController.set(OperatingMode.SCAN_SEEK)   // grounding runs only in scan/seek
+                vectorToGoal.setGoal(intent.target)
+                memoryNavActive = false
+                goalSetAtMs = System.currentTimeMillis(); goalEverSeen = false
+                sonifying = true
+                binding.switchSonify.isChecked = true
+                cueEngine.start()                            // context may have stopped it
+                announce("Looking for ${intent.target}.")
+            }
+            is VoiceIntent.Recall -> {
+                modeController.set(OperatingMode.SCAN_SEEK)
+                goalSetAtMs = System.currentTimeMillis(); goalEverSeen = false
+                recallObject(intent.target)
+                cueEngine.start()
+            }
+            VoiceIntent.Describe -> narrateScene()
+            VoiceIntent.SafetyCheck -> speakSafety()
+            VoiceIntent.ReadText -> readTextNow()
+            is VoiceIntent.SwitchContext -> contextManager.set(intent.context, System.currentTimeMillis())
+            VoiceIntent.Status -> announceStatus()
+            VoiceIntent.RepeatLast -> repeatLast()
+            is VoiceIntent.Cues ->
+                if (binding.switchSonify.isChecked != intent.on) toggleSonify()
+                else announce(if (intent.on) "Cues already on." else "Cues already off.")
+            VoiceIntent.Pause -> if (!paused) togglePause() else announce("Already paused.")
+            VoiceIntent.Resume -> if (paused) togglePause() else announce("Not paused.")
+            VoiceIntent.CancelSeek -> {
+                vectorToGoal.setGoal(null)
+                memoryNavActive = false
+                modeController.set(OperatingMode.FLOW)
+                announce("Stopped looking.")
+            }
+            VoiceIntent.Help -> speakHelp()
+            is VoiceIntent.CallContact -> {
+                val need = arrayOf(Manifest.permission.CALL_PHONE, Manifest.permission.READ_CONTACTS)
+                if (need.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }) {
+                    announce(PhoneActions.call(this, intent.name))
+                } else {
+                    pendingCallName = intent.name
+                    requestCallPerms.launch(need)
                 }
+            }
+            is VoiceIntent.SetTimer -> announce(PhoneActions.setTimer(this, intent.seconds))
+            is VoiceIntent.SetLanguage -> {
+                langPrefs.speakHindi = intent.hindi
+                binding.switchHindi.isChecked = intent.hindi
+                tts?.setLanguage(if (intent.hindi) Locale("hi", "IN") else Locale.US)
+                speakLocalized(
+                    if (intent.hindi) "अब हिंदी में बोलूँगा" else "Speaking English now.",
+                    intent.hindi, TextToSpeech.QUEUE_FLUSH, "lang",
+                )
+            }
+            is VoiceIntent.Unknown -> handleUnknown(intent.transcript)
+        }
+        updateBigStatus()
+    }
+
+    /**
+     * The grammar couldn't place it. If the Phase 4 LLM is loaded, let it reason over the
+     * transcript + a snapshot of the scene; otherwise say so honestly.
+     */
+    private fun handleUnknown(transcript: String) {
+        if (transcript.isBlank()) { announce("I didn't catch that."); return }
+        if (!llm.isReady()) {
+            announce("I didn't understand. Tap and say help for a list.")
+            return
+        }
+        announce("Thinking.")
+        val brief = sceneBrief()
+        android.util.Log.i("SecondSense/llm", "brief: $brief")
+        thread(name = "llm-resolve") {
+            val res = runCatching { llm.resolve(transcript, brief) }.getOrNull()
+            runOnUiThread {
+                when (res) {
+                    is LlmResolution.Action -> handleVoiceIntent(res.intent, recognizerReady = true)
+                    is LlmResolution.Speak -> announce(res.text)
+                    LlmResolution.Defer -> speakSafety()   // model flagged safety / green-lit movement
+                    null -> announce("I couldn't work that out.")
+                }
+            }
+        }
+    }
+
+    /**
+     * DETERMINISTIC, legally-vetted answer to any "is it safe / can I move / is it clear"
+     * question (deep-research layers 1 + 3). Never the LLM. Never uses "safe" as an affirmative.
+     * Fixed template + the current sensor state (worst in the 1.5 s hysteresis window) + an
+     * explicit hand-back of agency to the cane + traffic sounds. English or the vetted Hindi
+     * string per the listener's preference — spoken directly, NOT routed through the translator.
+     */
+    private fun speakSafety() {
+        val hi = langPrefs.speakHindi
+        val text = safetyAnswer(hi)
+        lastAnnouncement = text
+        android.util.Log.i(
+            "SecondSense/llm",
+            "SAFETY deflection -> \"$text\" | dets=${lastResult?.detections?.map { "${it.label}@${"%.2f".format(it.proximity)}" }} " +
+                "haz=${synchronized(hazardWindow) { hazardWindow.map { it.second?.name } }} cam=${lastResult?.cameraHealth}",
+        )
+        speakLocalized(text, hi, TextToSpeech.QUEUE_FLUSH, "safety")
+    }
+
+    private fun safetyAnswer(hindi: Boolean): String {
+        val r = lastResult
+        val camBad = r == null || !(r.cameraHealth == CameraHealth.OK || r.cameraHealth == CameraHealth.DIM)
+        val worst = synchronized(hazardWindow) { SafetyGate.mostSevere(hazardWindow.map { it.second }) }
+        // A safety readout reports EVERYTHING in view, with a distance qualifier — not just
+        // point-blank objects. Sorted nearest-first.
+        val seen = r?.detections
+            ?.filter { it.label != null && it.proximity >= 0.22f }
+            ?.sortedByDescending { it.proximity }
+            ?.map { d ->
+                val l = d.label!!
+                val where = d.box.centerX.let { cx -> if (cx < 0.4f) "on your left" else if (cx > 0.6f) "on your right" else "ahead" }
+                val how = if (d.proximity >= 0.6f) "$l close $where" else "$l $where"
+                how
+            }
+            ?.distinct()?.take(3).orEmpty()
+
+        // Sensor-state clause, injected into the fixed template.
+        val stateEn: String
+        val stateHi: String
+        when {
+            camBad -> { stateEn = "the camera cannot see clearly right now"; stateHi = "कैमरा अभी साफ़ नहीं देख पा रहा है" }
+            worst == ai.secondsense.app.inference.decode.HazardState.DROP_CONFIRMED -> {
+                stateEn = "there is a drop-off directly ahead"; stateHi = "आगे एक गड्ढा या सीढ़ी है"
+            }
+            worst == ai.secondsense.app.inference.decode.HazardState.SCENE_NOT_TRAVERSABLE -> {
+                stateEn = "the path ahead looks blocked"; stateHi = "आगे का रास्ता बंद लग रहा है"
+            }
+            worst == ai.secondsense.app.inference.decode.HazardState.SENSOR_BLOCKED -> {
+                stateEn = "the sensors are blocked and cannot tell"; stateHi = "सेंसर बंद हैं और कुछ बता नहीं सकते"
+            }
+            worst == ai.secondsense.app.inference.decode.HazardState.POSSIBLE_DROP -> {
+                stateEn = "there may be a step or drop ahead"; stateHi = "आगे सीढ़ी या गड्ढा हो सकता है"
+            }
+            seen.isNotEmpty() -> {
+                stateEn = "the camera sees ${seen.joinToString(", ")}"
+                stateHi = "कैमरे को दिख रहा है: ${seen.joinToString(", ")}"
+            }
+            else -> { stateEn = "no objects are detected ahead"; stateHi = "आगे कोई वस्तु नहीं दिख रही" }
+        }
+        return if (hindi) {
+            "मैं यह तय नहीं कर सकता कि आगे बढ़ना सुरक्षित है या नहीं। सेंसर बता रहे हैं कि $stateHi, " +
+                "लेकिन आगे बढ़ने के लिए आपको अपनी छड़ी, ट्रैफ़िक की आवाज़ और अपने निर्णय पर निर्भर रहना होगा।"
+        } else {
+            "I cannot decide whether it is safe to move. The sensors show that $stateEn, " +
+                "but you must rely on your white cane, traffic sounds, and your own judgement to proceed."
+        }
+    }
+
+    /** A compact snapshot of what the pipeline currently perceives, for the LLM prompt. */
+    private fun sceneBrief(): SceneBrief {
+        val r = lastResult
+        val objs = r?.detections
+            ?.sortedByDescending { it.proximity }
+            ?.mapNotNull { d ->
+                d.label?.let { lbl ->
+                    val cx = d.box.centerX
+                    when { cx < 0.4f -> "$lbl to the left"; cx > 0.6f -> "$lbl to the right"; else -> "$lbl ahead" }
+                }
+            }
+            ?.distinct()?.take(4).orEmpty()
+        val hazard = when (r?.hazardState?.name) {
+            "DROP_CONFIRMED" -> "drop-off ahead"
+            "POSSIBLE_DROP" -> "possible drop-off ahead"
+            "SCENE_NOT_TRAVERSABLE" -> "path blocked"
+            else -> null
+        }
+        return SceneBrief(
+            context = contextManager.context.name.lowercase(),
+            objectsAhead = objs,
+            hazard = hazard,
+            batteryPct = batteryPercent(),
+            camera = camHealthShort().removePrefix("camera ").trim(),
+            lastSpoken = lastAnnouncement,
+        )
+    }
+
+    /** One-shot OCR of the latest frame for a spoken "read this" (Phase 3). */
+    private fun readTextNow() {
+        val src = lastFrameForOcr
+        if (src == null || src.isRecycled) { announce("No camera image yet."); return }
+        val cfg = src.config ?: android.graphics.Bitmap.Config.ARGB_8888
+        val copy = runCatching { src.copy(cfg, false) }.getOrNull()
+        if (copy == null) { announce("Can't read right now."); return }
+        announce("Reading.")
+        perception.readNow(copy) { text, isDeva ->
+            runOnUiThread {
+                if (text.isNullOrBlank()) announce("I don't see any text.")
+                else onSignRead(text, isDeva)
             }
         }
     }
@@ -1004,6 +1319,14 @@ class MainActivity : AppCompatActivity() {
 
         handleCameraHealth(result.cameraHealth)
 
+        // SAFETY FLOOR — runs in EVERY context, even Sitting/Transit where the hazard pipeline
+        // is off: something within arm's reach and closing fast still earns one haptic.
+        val imminent = result.detections.any { it.proximity >= 0.90f && it.approaching >= 0.12f }
+        if (imminent && System.currentTimeMillis() - lastFloorMs > 3000L) {
+            lastFloorMs = System.currentTimeMillis()
+            haptics.possibleDrop()
+        }
+
         // OBJECT MEMORY: a named object just came to rest in view -> log where it is, in the
         // dead-reckoned local frame. Cheap; only consulted by a later "where is my X" query.
         result.settledObject?.let { s ->
@@ -1071,6 +1394,13 @@ class MainActivity : AppCompatActivity() {
             haptics.pathBlocked()
         }
         lastHazardState = hazardState
+        synchronized(hazardWindow) {
+            val now = System.currentTimeMillis()
+            hazardWindow.addLast(now to hazardState)
+            while (hazardWindow.isNotEmpty() && now - hazardWindow.first().first > HAZARD_WINDOW_MS) {
+                hazardWindow.removeFirst()
+            }
+        }
 
         // PHASE 4 (#27/#28) — voice goal-seeking, closed-vocab TFLite path. When a spoken goal
         // is active AND we're stopped (SCAN_SEEK, per #25), steer toward the matching COCO
@@ -1078,13 +1408,30 @@ class MainActivity : AppCompatActivity() {
         // clear the goal, fall back to the obstacle spine.
         val goalMatch = if (modeController.acceptsVoiceCommands)
             GoalGrounding.match(result.detections, vectorToGoal.activeGoal) else null
+        // Demo safety-net: a spoken Find target that the detector can't recognise (not a COCO
+        // class, e.g. "keys") would otherwise just sit there silently. If it's never once been
+        // seen within ~7 s, say so and drop it instead of leaving the user waiting.
+        if (vectorToGoal.isActive && !memoryNavActive) {
+            if (goalMatch != null) goalEverSeen = true
+            else if (!goalEverSeen && goalSetAtMs > 0 && System.currentTimeMillis() - goalSetAtMs > 7_000L) {
+                val g = vectorToGoal.activeGoal
+                vectorToGoal.setGoal(null); goalSetAtMs = 0L
+                runOnUiThread {
+                    announce("I can't see a $g. I can only spot common things like people, chairs, doors, bottles and bags.")
+                    modeController.set(OperatingMode.FLOW)
+                }
+            }
+        }
         val goalCue = goalMatch?.let { m ->
             val prox = calibration.apply(m.proximity)
             if (vectorToGoal.hasArrived(m.box, prox)) {
                 haptics.arrived()
                 val reached = vectorToGoal.activeGoal
                 vectorToGoal.setGoal(null)
-                runOnUiThread { Toast.makeText(this, "Arrived: $reached", Toast.LENGTH_SHORT).show() }
+                runOnUiThread {
+                    announce("You've reached the $reached.")
+                    modeController.set(OperatingMode.FLOW)
+                }
                 null
             } else {
                 vectorToGoal.cueFor(m.box, prox)
@@ -1135,7 +1482,20 @@ class MainActivity : AppCompatActivity() {
         // its own "path blocked" haptic).
         val camUsable = result.cameraHealth == CameraHealth.OK || result.cameraHealth == CameraHealth.DIM
         val target = if (!camUsable) null else goalCue ?: memoryCue ?: gatedObstacle
-        if (sonifying && !paused) cueEngine.update(target)
+        // A live spoken/memory goal steers regardless of the context's sonification setting.
+        val voiceGoalLive = vectorToGoal.isActive || memoryNavActive
+        if (sonifying && !paused && (contextManager.profile.sonification || voiceGoalLive)) {
+            cueEngine.start()
+            cueEngine.update(target)
+        }
+        if (vectorToGoal.isActive && frameCount % 20 == 0L) {
+            android.util.Log.i(
+                "SecondSense/goal",
+                "goal=${vectorToGoal.activeGoal} mode=${modeController.mode} " +
+                    "match=${goalMatch?.label} cue=${goalCue != null} " +
+                    "dets=${result.detections.mapNotNull { it.label }}",
+            )
+        }
         publishDashboardState(result, target)
         updateBigStatus()
 
@@ -1232,6 +1592,7 @@ class MainActivity : AppCompatActivity() {
         cueEngine.update(null)
         EngineConfig.imuTracker?.stop()
         pedometer.stop()
+        contextAutoDetector.stop()
         barometer.stop()
         thermalGovernor.stop()
         hazardDetector.stop()
@@ -1243,6 +1604,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         EngineConfig.imuTracker?.start()
         pedometer.start()
+        contextAutoDetector.start()
         barometer.start()
         thermalGovernor.start(this)
         if (sonifying) cueEngine.start()
@@ -1274,5 +1636,7 @@ class MainActivity : AppCompatActivity() {
         tts?.run { stop(); shutdown() }
         runCatching { perception.close() }
         runCatching { translator.close() }
+        runCatching { llm.close() }
+        runCatching { safetyVectorGate.close() }
     }
 }

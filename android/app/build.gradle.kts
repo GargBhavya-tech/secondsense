@@ -118,6 +118,18 @@ android {
     if (enableSherpa) {
         sourceSets.getByName("main").java.srcDir("src/sherpa/kotlin")
     }
+
+    // ---------------------------------------------------------------------
+    // OPTIONAL ON-DEVICE LLM — Phase 4 reasoning fallback (Llama-3.2-1B INT4 via MediaPipe).
+    // OFF by default: `gradlew assembleDebug` has ZERO MediaPipe footprint and LlmAssistants
+    // returns the stub. Enable with -PenableLlm=true to compile src/llm/kotlin/ (the
+    // MediaPipeLlmAssistant) AND pull com.google.mediapipe:tasks-genai (see dependencies{}).
+    // The ~1 GB .task model is still never bundled — side-load it per MediaPipeLlmAssistant's
+    // header. Without the model file the assistant just reports isReady()==false.
+    val enableLlm = project.findProperty("enableLlm")?.toString().toBoolean()
+    if (enableLlm) {
+        sourceSets.getByName("main").java.srcDir("src/llm/kotlin")
+    }
 }
 
 dependencies {
@@ -179,6 +191,14 @@ dependencies {
     // ArCoreApk.checkAvailability(), not by this version. Marked optional in the manifest so
     // the app still installs + runs (nav pipeline unaffected) on non-AR devices.
     implementation("com.google.ar:core:1.47.0")
+
+    // ---- Phase 4 on-device LLM (opt-in: -PenableLlm=true) --------------------------------
+    // MediaPipe LLM Inference API — runs a quantized Llama-3.2-1B .task on CPU/GPU. Native
+    // libs are arm64-v8a + x86_64 only (both already in abiFilters). ~25 MB of the APK; the
+    // model file itself is side-loaded, never packaged. No-op unless the flag is set.
+    if (project.findProperty("enableLlm")?.toString().toBoolean()) {
+        implementation("com.google.mediapipe:tasks-genai:0.10.24")
+    }
 
     // Unit tests for the pure-logic layer (targeting, channel math)
     testImplementation("junit:junit:4.13.2")

@@ -86,7 +86,11 @@ class SceneAnalyzer(
             imuTracker?.rollDeg ?: 0f,
         )
 
-        val evidence: RawEvidence = if (runHeavy) {
+        // Context can disable the whole drop-off / hazard pipeline (e.g. TRANSIT — a moving
+        // vehicle makes ego-motion + optical flow produce nothing but phantom hazards). Skip
+        // all the evidence gathering too, not just the state-machine update.
+        val hazardDisabled = hazardEveryN <= 0
+        val evidence: RawEvidence? = if (hazardDisabled) null else if (runHeavy) {
             val lattice = EdgeLattice.detect(curGray, GRAY_W, GRAY_H, corridor)
             val (depthVerdict, _) = groundPlaneAnalyzer.depthEvidence(depthFrame, corridor)
             val edgeBand = lattice.nearestRowFraction?.let { (it - 0.05f) to (it + 0.05f) }
@@ -117,12 +121,12 @@ class SceneAnalyzer(
                 groundCoplanar = groundCoplanar,
             )
         } else {
-            lastEvidence!!
+            lastEvidence
         }
-        lastEvidence = evidence
+        if (evidence != null) lastEvidence = evidence
 
         val nowMs = System.currentTimeMillis()
-        val hz = hazardStateMachine.update(evidence, nowMs)
+        val hz = if (evidence == null) null else hazardStateMachine.update(evidence, nowMs)
         val annotated = motion.annotate(detections, ego)
 
         // Object-memory: keep the floor->metric fit fresh (throttled), tag each named
@@ -140,10 +144,10 @@ class SceneAnalyzer(
 
         return Result(
             detections = annotated,
-            hazardState = hz.state,
-            hazardConfidence = hz.confidence,
-            hazardUrgency = hz.urgency,
-            hazardFirstEdgeY = hz.firstEdgeY,
+            hazardState = hz?.state,
+            hazardConfidence = hz?.confidence ?: 0f,
+            hazardUrgency = hz?.urgency ?: 0f,
+            hazardFirstEdgeY = hz?.firstEdgeY,
             egoMotionX = ego.first,
             egoMotionY = ego.second,
             settledObject = settled,
