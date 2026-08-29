@@ -775,7 +775,12 @@ class MainActivity : AppCompatActivity() {
         // between POSSIBLE_DROP and SAFE frame to frame; SCENE_NOT_TRAVERSABLE and
         // SENSOR_BLOCKED get no drop cue at all (the plan asks for a distinct "path blocked"
         // cue — deferred to keep scope tight; silence is at least not a FALSE drop cue).
-        val hazardState = result.hazardState
+        // Specular Trap veto C (safety re-escalation): a chromaticity/flow veto may have held a
+        // real drop at POSSIBLE_DROP. If the BAROMETER independently confirms a descent, trust
+        // physics over the optical vetoes and treat it as confirmed.
+        val hazardState = if (result.hazardState == ai.secondsense.app.inference.decode.HazardState.POSSIBLE_DROP &&
+            barometer.descendingConfirmed()
+        ) ai.secondsense.app.inference.decode.HazardState.DROP_CONFIRMED else result.hazardState
         val baroConfirmed = hazardState == ai.secondsense.app.inference.decode.HazardState.DROP_CONFIRMED &&
             barometer.descendingConfirmed()
         if (hazardState == ai.secondsense.app.inference.decode.HazardState.DROP_CONFIRMED &&

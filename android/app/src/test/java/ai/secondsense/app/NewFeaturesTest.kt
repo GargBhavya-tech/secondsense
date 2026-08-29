@@ -8,7 +8,10 @@ import ai.secondsense.app.inference.CameraHealth
 import ai.secondsense.app.inference.SettledSighting
 import ai.secondsense.app.inference.decode.CameraHealthMonitor
 import ai.secondsense.app.inference.decode.DetectionStabilizer
+import ai.secondsense.app.inference.decode.DepthVerdict
+import ai.secondsense.app.inference.decode.HazardFusion
 import ai.secondsense.app.inference.decode.HazardState
+import ai.secondsense.app.inference.decode.RawEvidence
 import ai.secondsense.app.inference.decode.RestingStateVerifier
 import ai.secondsense.app.memory.DeadReckoner
 import ai.secondsense.app.memory.MemoryPhrase
@@ -296,5 +299,63 @@ class PerfPolicyTest {
         val p = PerfPolicy.policyFor(ThermalTier.NOMINAL, walking = true)
         assertEquals(1, p.frameEveryN)
         assertTrue(p.auxEnabled && p.yamnetEnabled && !p.lowRes)
+    }
+}
+
+/** Specular Trap veto A: a chromaticity-shadow edge downgrades a confirmed drop, nothing else. */
+class SpecularShadowVetoTest {
+    private fun ev(lattice: Float, edgeY: Float, depth: DepthVerdict, shadow: Float) = RawEvidence(
+        latticeScore = lattice, nearestEdgeY = edgeY, depthVerdict = depth,
+        highRotation = false, lowLight = false, sensorBlocked = false, shadowLikelihood = shadow,
+    )
+
+    @Test fun castShadowDowngradesAConfirmedDropButNotARealOne() {
+        val real = ev(0.7f, 0.6f, DepthVerdict.SUPPORTS, shadow = 0.10f)
+        assertEquals(HazardState.DROP_CONFIRMED, HazardFusion.classifySingleFrame(real))
+        val shadow = ev(0.7f, 0.6f, DepthVerdict.SUPPORTS, shadow = 0.80f)
+        assertEquals(HazardState.POSSIBLE_DROP, HazardFusion.classifySingleFrame(shadow))
+    }
+
+    @Test fun vetoNeverTouchesPossibleOrSafe() {
+        // strong lattice, depth contradicts -> already only POSSIBLE_DROP; veto leaves it.
+        assertEquals(
+            HazardState.POSSIBLE_DROP,
+            HazardFusion.classifySingleFrame(ev(0.7f, 0.6f, DepthVerdict.CONTRADICTS, shadow = 0.9f)),
+        )
+        // weak evidence -> SAFE stays SAFE.
+        assertEquals(
+            HazardState.SAFE,
+            HazardFusion.classifySingleFrame(ev(0.1f, 0.6f, DepthVerdict.UNRELIABLE, shadow = 0.9f)),
+        )
+    }
+}
+
+/** Specular Trap veto B: flow that stays coplanar with the floor => flat wet/glossy, not a hole. */
+class SpecularCoplanarVetoTest {
+    private fun ev(lattice: Float, depth: DepthVerdict, coplanar: Float) = RawEvidence(
+        latticeScore = lattice, nearestEdgeY = 0.6f, depthVerdict = depth,
+        highRotation = false, lowLight = false, sensorBlocked = false, groundCoplanar = coplanar,
+    )
+
+    @Test fun coplanarFlowDowngradesAConfirmedDrop() {
+        assertEquals(
+            HazardState.DROP_CONFIRMED,
+            HazardFusion.classifySingleFrame(ev(0.7f, DepthVerdict.SUPPORTS, coplanar = 0.1f)),
+        )
+        assertEquals(
+            HazardState.POSSIBLE_DROP,
+            HazardFusion.classifySingleFrame(ev(0.7f, DepthVerdict.SUPPORTS, coplanar = 0.85f)),
+        )
+    }
+
+    @Test fun coplanarFlowClearsAPossibleDropToSafe() {
+        assertEquals(
+            HazardState.POSSIBLE_DROP,
+            HazardFusion.classifySingleFrame(ev(0.7f, DepthVerdict.CONTRADICTS, coplanar = 0.1f)),
+        )
+        assertEquals(
+            HazardState.SAFE,
+            HazardFusion.classifySingleFrame(ev(0.7f, DepthVerdict.CONTRADICTS, coplanar = 0.85f)),
+        )
     }
 }

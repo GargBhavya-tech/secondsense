@@ -69,6 +69,7 @@ class SceneAnalyzer(
         )
         val camBlocked = camHealth == CameraHealth.BLOCKED || camHealth == CameraHealth.MISALIGNED
 
+        val flowPrev = prevGray   // hold the true previous frame — prevGray is overwritten below
         val ego: Pair<Float, Float> = if (runHeavy) {
             prevGray?.let { pg ->
                 val (dxPx, dyPx) = OpticalFlow.estimateEgoMotion(pg, curGray, GRAY_W, GRAY_H)
@@ -94,6 +95,15 @@ class SceneAnalyzer(
             val nearFieldY1 = corridor.y1 + 0.6f * (corridor.y2 - corridor.y1)
             val nearFieldObjectCoverage =
                 GroundView.objectCoverage(detections, corridor, nearFieldY1, corridor.y2)
+            // Specular Trap veto A: is the candidate edge a cast shadow (luminance step, no
+            // hue step)? Full-res RGB frame, only when there's an edge to test.
+            val shadowLikelihood = lattice.nearestRowFraction?.let {
+                ShadowChromaticity.shadowLikelihood(frame, it, corridor)
+            } ?: 0f
+            // Veto B: is the edge band moving coplanar with the floor (puddle / wet marble)?
+            val groundCoplanar = lattice.nearestRowFraction?.let {
+                GroundFlowConsistency.coplanarConfidence(flowPrev, curGray, GRAY_W, GRAY_H, corridor, it, ego)
+            } ?: 0f
             RawEvidence(
                 latticeScore = lattice.score,
                 nearestEdgeY = lattice.nearestRowFraction,
@@ -103,6 +113,8 @@ class SceneAnalyzer(
                 sensorBlocked = camBlocked,
                 objectOverlap = objectOverlap,
                 nearFieldObjectCoverage = nearFieldObjectCoverage,
+                shadowLikelihood = shadowLikelihood,
+                groundCoplanar = groundCoplanar,
             )
         } else {
             lastEvidence!!

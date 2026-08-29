@@ -63,6 +63,22 @@ data class RawEvidence(
      * in the way," not "there's floor here" — see [GroundView.groundViewValid].
      */
     val nearFieldObjectCoverage: Float = 0f,
+    /**
+     * Problem Statement 3 ("Specular Trap") — Veto A. 0..1 confidence that the candidate
+     * drop-off edge is a CAST SHADOW (sharp luminance step, no chromaticity step) rather than
+     * a physical one — see [ShadowChromaticity]. Only ever downgrades a confirmation; a real
+     * geometric depth SUPPORTS still wins, and dark-but-real materials keep a hue edge so they
+     * don't score here. 0f when there's no candidate edge to test.
+     */
+    val shadowLikelihood: Float = 0f,
+    /**
+     * Problem Statement 3 ("Specular Trap") — Veto B. 0..1 confidence that the candidate
+     * drop-off region is moving COPLANAR with the surrounding floor (affine optical-flow
+     * residual is low across the edge band) — i.e. a flat puddle / wet marble / polished tile
+     * the depth net hallucinated a void in, not a real hole. See [GroundFlowConsistency].
+     * 0f when the wearer is stationary or there isn't enough trackable texture.
+     */
+    val groundCoplanar: Float = 0f,
 )
 
 object HazardFusion {
@@ -82,6 +98,12 @@ object HazardFusion {
     /** Between [OBJECT_REJECT_OVERLAP] and this, the lattice score is scaled down rather than
      * rejected outright — YOLO boxes can legitimately overlap a real stair edge too. */
     private const val OBJECT_DAMPEN_OVERLAP = 0.30f
+    /** Specular Trap veto A — chromaticity shadow confidence at/above which a DROP_CONFIRMED
+     * is downgraded to POSSIBLE_DROP (see [RawEvidence.shadowLikelihood]). */
+    private const val SHADOW_VETO = 0.6f
+    /** Specular Trap veto B — flow-coplanarity confidence at/above which the "hole" is really
+     * a flat wet/glossy surface: downgrade DROP_CONFIRMED and clear POSSIBLE_DROP. */
+    private const val COPLANAR_VETO = 0.6f
 
     /**
      * Single-frame rule baseline. VALIDATED OFFLINE (debug_v3_fusion.py) on 4 static regression
@@ -120,13 +142,29 @@ object HazardFusion {
             return if (weak) HazardState.POSSIBLE_DROP else HazardState.SAFE
         }
 
-        return when {
+        val base = when {
             strong && evidence.depthVerdict == DepthVerdict.SUPPORTS -> HazardState.DROP_CONFIRMED
             strong && evidence.depthVerdict == DepthVerdict.UNRELIABLE -> HazardState.POSSIBLE_DROP
             strong && evidence.depthVerdict == DepthVerdict.CONTRADICTS -> HazardState.POSSIBLE_DROP
             weak && evidence.depthVerdict == DepthVerdict.SUPPORTS -> HazardState.POSSIBLE_DROP
             else -> HazardState.SAFE
         }
+
+        // Specular Trap veto B: the edge band is moving coplanar with the floor -> it's a
+        // flat wet/glossy surface, not a void. This is the stronger signal (it's physics, not
+        // photometry) so it clears POSSIBLE_DROP too. The barometer tie-break in MainActivity
+        // still re-escalates if a real descent is measured.
+        if (evidence.groundCoplanar >= COPLANAR_VETO) {
+            return if (base == HazardState.DROP_CONFIRMED) HazardState.POSSIBLE_DROP else HazardState.SAFE
+        }
+
+        // Specular Trap veto A: a sharp luminance edge with NO chromaticity edge is a cast
+        // shadow, not a step. Don't slam the emergency brake on it — downgrade a confirmation
+        // to POSSIBLE_DROP (still a "careful" cue). A real material/geometry edge keeps a hue
+        // step, so it never scores high here — the dark-asphalt-stairs case is safe.
+        return if (base == HazardState.DROP_CONFIRMED && evidence.shadowLikelihood >= SHADOW_VETO)
+            HazardState.POSSIBLE_DROP
+        else base
     }
 }
 
