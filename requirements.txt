@@ -1,0 +1,5 @@
+# SecondSense — Green Light (laptop) model-conversion toolchain.
+# Pinned to the versions verified for this build. Install in a venv.
+# torch is pulled transitively by qai-hub-models; don't pin it separately.
+qai-hub==0.55.0
+qai-hub-models==0.61.0

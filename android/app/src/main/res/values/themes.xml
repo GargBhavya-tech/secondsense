@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.SecondSense" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/ss_primary</item>
+        <item name="colorOnPrimary">@color/ss_on_primary</item>
+        <item name="android:statusBarColor">@color/ss_bg</item>
+        <item name="android:navigationBarColor">@color/ss_panel</item>
+    </style>
+</resources>

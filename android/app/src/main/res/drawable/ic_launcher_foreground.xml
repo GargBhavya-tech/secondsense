@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- source point -->
+    <path
+        android:fillColor="#2DD4BF"
+        android:pathData="M40,54m-5,0a5,5 0,1 1,10 0a5,5 0,1 1,-10 0" />
+    <!-- radiating arcs (direction + distance motif) -->
+    <path
+        android:strokeColor="#4FD1C5"
+        android:strokeWidth="3"
+        android:fillColor="#00000000"
+        android:pathData="M50,42 A16,16 0 0 1 50,66" />
+    <path
+        android:strokeColor="#4FD1C5"
+        android:strokeWidth="3"
+        android:fillColor="#00000000"
+        android:strokeAlpha="0.7"
+        android:pathData="M58,36 A26,26 0 0 1 58,72" />
+    <path
+        android:strokeColor="#4FD1C5"
+        android:strokeWidth="3"
+        android:fillColor="#00000000"
+        android:strokeAlpha="0.4"
+        android:pathData="M66,30 A36,36 0 0 1 66,78" />
+</vector>

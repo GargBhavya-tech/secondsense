@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SecondSense</string>
+    <string name="test_tone">Test Tone</string>
+    <string name="test_buzz">Test Buzz</string>
+    <string name="flow_center_crop">Flow mode — center crop (#14)</string>
+    <string name="sonify">Sonification — cue loop (#22)</string>
+    <string name="mode_scan_seek">Scan/seek mode — stopped, exploring (#25)</string>
+    <string name="calibrate">Calibrate (1-tap baseline) (#7)</string>
+    <string name="find_voice">Find… (voice) (#26)</string>
+    <string name="debug_panel">Debug Panel — test one thing at a time</string>
+    <string name="dashboard_qr_desc">QR code to open the live dashboard on a laptop</string>
+    <string name="hud_booting">booting…</string>
+</resources>

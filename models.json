@@ -1,0 +1,56 @@
+{
+  "_comment": "SecondSense target models for Qualcomm AI Hub conversion. Module names VERIFIED against qai-hub-models 0.61.0. 'group' controls default selection in convert.py. 'quantize' is left null on purpose: get a working float binary first, quantize as a second pass (Bible §23.2 INT8/W4A8 are intent; the real flag is per-model, so check `python -m qai_hub_models.models.<module>.export --help`).",
+
+  "models": [
+    {
+      "module": "mobilenet_v3_small",
+      "role": "HELLO-WORLD — prove the toolchain end-to-end before any real model",
+      "group": "hello",
+      "quantize": null,
+      "note": "Smallest model. If this compiles+profiles+downloads, the plumbing works."
+    },
+    {
+      "module": "yolo26_det",
+      "ckpt_name": "yolo26s.pt",
+      "role": "Object detection & classification (upgraded from yolov11n)",
+      "group": "core",
+      "quantize": null,
+      "note": "SWAPPED from yolov11_det: yolo26s tests far more confident on real photos (bottle 0.34-0.57 vs 0.07-0.34) at 5.3ms NPU. Same boxes/scores/class_idx output contract, so YoloDecoder + the bundled asset filename (yolov11_det.tflite) are unchanged. Export needs --ckpt-name yolo26s.pt (default is yolo26n)."
+    },
+    {
+      "module": "depth_anything_v2",
+      "role": "Monocular relative-depth, incl. drop-off case (Bible Depth-Anything-V2)",
+      "group": "core",
+      "quantize": null,
+      "note": "Bible wants W4A8 later; confirm real --precision via export --help."
+    },
+    {
+      "module": "whisper_tiny",
+      "role": "On-device speech for voice commands (Bible Whisper-Tiny)",
+      "group": "core",
+      "quantize": null,
+      "note": "NAME CORRECTED: zoo module is whisper_tiny, NOT whisper_tiny_en. Multi-component (encoder/decoder) — expect multiple assets + longer export."
+    },
+    {
+      "module": "owl_vit",
+      "role": "Open-vocabulary object grounding (Bible OWL-ViT) — the moat",
+      "group": "core",
+      "quantize": null,
+      "note": "Multi-tower (text+image). Fallback option if it fights back: yolo_world (also in the zoo)."
+    },
+    {
+      "module": "yamnet",
+      "role": "Async hazard-sound detection (horns/sirens) — Bible medium priority",
+      "group": "optional",
+      "quantize": null,
+      "note": "Only after the spine is green."
+    },
+    {
+      "module": "fastsam_x",
+      "role": "Pixel-level segmentation for precision — Bible optional",
+      "group": "optional",
+      "quantize": null,
+      "note": "NAME CORRECTED: zoo ships fastsam_x, NOT fastsam_s."
+    }
+  ]
+}

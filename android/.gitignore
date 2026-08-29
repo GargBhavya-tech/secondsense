@@ -1,0 +1,26 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/app/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+
+# --- Large model assets — regenerate with `python convert.py` (see repo README) ---
+#     README.txt and yamnet_labels.txt in that folder ARE kept.
+/app/src/main/assets/models/*.tflite
+/app/src/main/assets/models/*.bin
+
+# --- Native runtime libs — NOT redistributed here ---
+#     Qualcomm QNN .so: from the Qualcomm AI Engine Direct SDK (see android/README.md).
+#     sherpa-onnx .so:  from https://github.com/k2-fsa/sherpa-onnx/releases (see app/src/sherpa/README.md).
+/app/src/main/jniLibs/
+
+# --- Optional sherpa-onnx offline-ASR drop-ins (see app/src/sherpa/README.md) ---
+/app/src/sherpa/kotlin/com/
+/app/src/main/assets/kws/

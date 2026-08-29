@@ -1,0 +1,31 @@
+# --- Python (laptop model-conversion pipeline) ---
+secondsense-venv/
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# --- Generated / large artifacts ---
+export_assets/*
+!export_assets/.gitkeep
+!export_assets/README.md
+logs/*
+!logs/.gitkeep
+conversion_manifest.json
+*.zip
+.dist/
+
+# --- Model checkpoints (download from Ultralytics, or produced by convert.py) ---
+*.pt
+
+# --- Ad-hoc screenshots (the CV test fixtures used by debug_*.py ARE kept) ---
+baro_check*.png
+dash_check*.png
+
+# --- Editor / tooling ---
+.idea/
+*.iml
+.claude/
+.qai_hub/
+.DS_Store
+Thumbs.db

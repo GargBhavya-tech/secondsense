@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ss_bg">#0B0F14</color>
+    <color name="ss_panel">#11171F</color>
+    <color name="ss_hud_scrim">#AA000000</color>
+    <color name="ss_text">#E6EDF3</color>
+    <color name="ss_accent">#4FD1C5</color>
+    <color name="ss_primary">#2DD4BF</color>
+    <color name="ss_on_primary">#04211D</color>
+</resources>
