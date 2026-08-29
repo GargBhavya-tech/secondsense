@@ -1,6 +1,7 @@
 package ai.secondsense.app.inference.decode
 
 import android.graphics.Bitmap
+import ai.secondsense.app.inference.CameraHealth
 import ai.secondsense.app.inference.Detection
 import ai.secondsense.app.inference.SettledSighting
 import ai.secondsense.app.sensors.ImuTracker
@@ -33,6 +34,8 @@ class SceneAnalyzer(
     // memory feature, and is harmless otherwise.
     private val metricScaler = MetricDepthScaler()
     private val restingVerifier = RestingStateVerifier()
+    // Chest-mount tamper / occlusion / knock-off detection.
+    private val cameraHealthMonitor = CameraHealthMonitor()
 
     private var prevGray: FloatArray? = null
     private var tick = 0L
@@ -48,11 +51,21 @@ class SceneAnalyzer(
         val egoMotionX: Float,
         val egoMotionY: Float,
         val settledObject: SettledSighting? = null,
+        val cameraHealth: CameraHealth = CameraHealth.OK,
     )
 
     fun analyze(frame: Bitmap, depthFrame: DepthSampler.Frame, detections: List<Detection>): Result {
         val curGray = OpticalFlow.toGrayscale(frame, GRAY_W, GRAY_H)
         val runHeavy = lastEvidence == null || (tick++ % hazardEveryN == 0L)
+
+        val camHealth = cameraHealthMonitor.update(
+            curGray,
+            imuTracker?.pitchDeg ?: 0f,
+            imuTracker?.rollDeg ?: 0f,
+            imuTracker?.hasMountCalibration ?: false,
+            System.currentTimeMillis(),
+        )
+        val camBlocked = camHealth == CameraHealth.BLOCKED || camHealth == CameraHealth.MISALIGNED
 
         val ego: Pair<Float, Float> = if (runHeavy) {
             prevGray?.let { pg ->
@@ -84,8 +97,8 @@ class SceneAnalyzer(
                 nearestEdgeY = lattice.nearestRowFraction,
                 depthVerdict = depthVerdict,
                 highRotation = imuTracker?.isHighRotation ?: false,
-                lowLight = false,
-                sensorBlocked = false,
+                lowLight = camHealth == CameraHealth.DIM,
+                sensorBlocked = camBlocked,
                 objectOverlap = objectOverlap,
                 nearFieldObjectCoverage = nearFieldObjectCoverage,
             )
@@ -120,6 +133,7 @@ class SceneAnalyzer(
             egoMotionX = ego.first,
             egoMotionY = ego.second,
             settledObject = settled,
+            cameraHealth = camHealth,
         )
     }
 
@@ -128,6 +142,7 @@ class SceneAnalyzer(
         hazardStateMachine.reset()
         metricScaler.reset()
         restingVerifier.reset()
+        cameraHealthMonitor.reset()
         prevGray = null
         tick = 0L
         lastEvidence = null

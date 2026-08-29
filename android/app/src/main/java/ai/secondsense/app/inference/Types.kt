@@ -67,6 +67,22 @@ data class Detection(
 )
 
 /**
+ * Camera-health verdict for the frame (chest-mount tamper / occlusion / knock-off detection).
+ * [ai.secondsense.app.inference.decode.CameraHealthMonitor] produces it; the UI warns the
+ * wearer and the hazard fusion treats anything but OK/DIM as SENSOR_BLOCKED.
+ */
+enum class CameraHealth {
+    /** Usable frame, plausible mount angle. */
+    OK,
+    /** Low light but still structured — degrade confidence, don't nag. */
+    DIM,
+    /** Lens covered / in a bag / total dark — frame is near-flat and near-black. */
+    BLOCKED,
+    /** Mount angle knocked well off level (staring at the ground / sky / hard roll). */
+    MISALIGNED,
+}
+
+/**
  * A named object that just came to REST in view this frame — the trigger for logging it into
  * short-horizon episodic memory (the "where are my keys" feature). Emitted by
  * [ai.secondsense.app.inference.decode.RestingStateVerifier] via [SceneAnalyzer].
@@ -145,4 +161,9 @@ data class FrameResult(
      * settled, and always null on the mock engine. See [SettledSighting].
      */
     val settledObject: SettledSighting? = null,
+    /**
+     * Chest-mount camera health this frame — occlusion / darkness / knocked-off angle.
+     * Defaults [CameraHealth.OK] so the mock and every existing call site are unaffected.
+     */
+    val cameraHealth: CameraHealth = CameraHealth.OK,
 )

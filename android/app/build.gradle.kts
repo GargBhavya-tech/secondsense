@@ -173,6 +173,13 @@ dependencies {
     // Face detection -> "person facing you" via head Euler-Y angle. Contour/classification off.
     implementation("com.google.mlkit:face-detection:16.1.7")
 
+    // ---- ARCore — 6-DOF camera pose for the persistent room map (Path B) -----------------
+    // The client lib is small; the actual tracking runs in "Google Play Services for AR"
+    // (auto-installed on Play devices). Device support is decided at RUNTIME via
+    // ArCoreApk.checkAvailability(), not by this version. Marked optional in the manifest so
+    // the app still installs + runs (nav pipeline unaffected) on non-AR devices.
+    implementation("com.google.ar:core:1.47.0")
+
     // Unit tests for the pure-logic layer (targeting, channel math)
     testImplementation("junit:junit:4.13.2")
 }

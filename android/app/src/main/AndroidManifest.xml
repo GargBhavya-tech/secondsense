@@ -22,6 +22,10 @@
         android:name="android.hardware.camera.any"
         android:required="true" />
 
+    <!-- ARCore (Path B room map): needs OpenGL ES 3.0. AR itself is optional (see the
+         com.google.ar.core meta-data below) so the app still installs on non-AR devices. -->
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+
     <!-- Android 11+ package visibility: lets AndroidSpeechRecognizer see the system
          RecognitionService for the built-in (interim) voice ASR path. -->
     <queries>
@@ -45,6 +49,10 @@
         <uses-native-library android:name="libadsprpc.so" android:required="false" />
         <uses-native-library android:name="libsdsprpc.so" android:required="false" />
 
+        <!-- ARCore: "optional" = install on any device; RoomScanActivity gates at runtime via
+             ArCoreApk.checkAvailability(). "required" would block install on non-AR phones. -->
+        <meta-data android:name="com.google.ar.core" android:value="optional" />
+
         <activity
             android:name=".ui.MainActivity"
             android:exported="true"
@@ -60,6 +68,14 @@
              Not launcher-visible; opened only via a button in MainActivity. -->
         <activity
             android:name=".ui.DebugActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- Path B: deliberate "walk your room once" scan. Isolated activity — owns the camera
+             via ARCore, separate from the live-nav CameraX pipeline. Opened from MainActivity. -->
+        <activity
+            android:name=".ar.RoomScanActivity"
             android:exported="false"
             android:screenOrientation="portrait"
             android:configChanges="orientation|screenSize|keyboardHidden" />

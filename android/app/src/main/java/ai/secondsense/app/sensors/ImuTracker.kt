@@ -72,6 +72,12 @@ class ImuTracker(context: Context) : SensorEventListener {
     var hasValidReading: Boolean = false
         private set
 
+    /** True once [calibrateMountingOffset] has been called — i.e. "level" has been defined for
+     * this mount, so pitch/roll now read ~0 at the intended vertical pose. The camera-health
+     * monitor only judges mount angle after this. */
+    var hasMountCalibration: Boolean = false
+        private set
+
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val gyro = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
     private val accel = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
@@ -104,6 +110,7 @@ class ImuTracker(context: Context) : SensorEventListener {
     fun calibrateMountingOffset() {
         mountingPitchOffset = pitchDeg + mountingPitchOffset // fold in any prior offset
         mountingRollOffset = rollDeg + mountingRollOffset
+        hasMountCalibration = true
     }
 
     override fun onSensorChanged(event: SensorEvent) {

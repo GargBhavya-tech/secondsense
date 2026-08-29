@@ -4,7 +4,9 @@ import ai.secondsense.app.inference.BBox
 import ai.secondsense.app.inference.ConfidenceTier
 import ai.secondsense.app.inference.Detection
 import ai.secondsense.app.inference.FrameResult
+import ai.secondsense.app.inference.CameraHealth
 import ai.secondsense.app.inference.SettledSighting
+import ai.secondsense.app.inference.decode.CameraHealthMonitor
 import ai.secondsense.app.inference.decode.DetectionStabilizer
 import ai.secondsense.app.inference.decode.HazardState
 import ai.secondsense.app.inference.decode.RestingStateVerifier
@@ -206,5 +208,46 @@ class ObstacleHabituationTest {
         val cue = h.filter(t(prox = 0.92f), walking = false, 900L)
         assertTrue("about-to-hit-it is never fully silenced", cue != null)
         assertEquals(0.33f, cue!!.proximity, 1e-4f)
+    }
+}
+
+/** Camera health: covered lens and off-vertical angle are caught (after debounce); normal is OK. */
+class CameraHealthMonitorTest {
+    private val dark = FloatArray(19_200) { 5f }                       // near-black, zero variance
+    private val normal = FloatArray(19_200) { if (it % 2 == 0) 90f else 150f } // mean 120, std 30
+
+    @Test fun normalLevelFrameIsOk() {
+        val m = CameraHealthMonitor()
+        assertEquals(CameraHealth.OK, m.update(normal, pitchDeg = 5f, rollDeg = 3f, imuCalibrated = true, nowMs = 0L))
+    }
+
+    @Test fun coveredLensReportsBlockedAfterSustain() {
+        val m = CameraHealthMonitor(sustainMs = 1_000L)
+        assertEquals(CameraHealth.OK, m.update(dark, 0f, 0f, imuCalibrated = false, nowMs = 0L))
+        assertEquals(CameraHealth.BLOCKED, m.update(dark, 0f, 0f, imuCalibrated = false, nowMs = 1_100L))
+    }
+
+    @Test fun offVerticalAngleReportsMisalignedWhenCalibrated() {
+        val m = CameraHealthMonitor(sustainMs = 1_000L, pitchToleranceDeg = 14f)
+        m.update(normal, pitchDeg = 30f, rollDeg = 0f, imuCalibrated = true, nowMs = 0L)   // tilted down
+        assertEquals(CameraHealth.MISALIGNED, m.update(normal, 30f, 0f, imuCalibrated = true, nowMs = 1_100L))
+    }
+
+    @Test fun noAngleWarningUntilCalibrated() {
+        val m = CameraHealthMonitor(sustainMs = 500L)
+        // Same big tilt, but calibration never done -> never MISALIGNED.
+        repeat(6) { i -> m.update(normal, 40f, 0f, imuCalibrated = false, nowMs = i * 400L) }
+        assertEquals(CameraHealth.OK, m.update(normal, 40f, 0f, imuCalibrated = false, nowMs = 3_000L))
+        // Once calibrated, the same tilt is flagged after the sustain window.
+        m.update(normal, 40f, 0f, imuCalibrated = true, nowMs = 3_100L)
+        assertEquals(CameraHealth.MISALIGNED, m.update(normal, 40f, 0f, imuCalibrated = true, nowMs = 3_700L))
+    }
+
+    @Test fun recoversAfterClearWindow() {
+        val m = CameraHealthMonitor(sustainMs = 500L, clearMs = 500L)
+        m.update(dark, 0f, 0f, imuCalibrated = false, nowMs = 0L)
+        assertEquals(CameraHealth.BLOCKED, m.update(dark, 0f, 0f, imuCalibrated = false, nowMs = 600L))
+        assertEquals(CameraHealth.BLOCKED, m.update(normal, 0f, 0f, imuCalibrated = false, nowMs = 700L))
+        assertEquals(CameraHealth.OK, m.update(normal, 0f, 0f, imuCalibrated = false, nowMs = 1_300L))
     }
 }

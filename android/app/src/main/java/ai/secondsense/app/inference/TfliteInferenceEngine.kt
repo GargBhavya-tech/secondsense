@@ -279,6 +279,7 @@ class TfliteInferenceEngine(
             hazardUrgency = scene.hazardUrgency,
             hazardFirstEdgeY = scene.hazardFirstEdgeY,
             settledObject = scene.settledObject,
+            cameraHealth = scene.cameraHealth,
         )
     }
 

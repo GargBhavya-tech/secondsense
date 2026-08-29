@@ -37,6 +37,7 @@ import ai.secondsense.app.databinding.ActivityMainBinding
 import ai.secondsense.app.sensors.BarometerMonitor
 import org.json.JSONArray
 import org.json.JSONObject
+import ai.secondsense.app.inference.CameraHealth
 import ai.secondsense.app.inference.EngineConfig
 import ai.secondsense.app.inference.FrameResult
 import ai.secondsense.app.inference.InferenceEngine
@@ -129,6 +130,10 @@ class MainActivity : AppCompatActivity() {
     private val stabilizer = DetectionStabilizer()
     // Stop nagging about a static obstacle the user is standing near but not approaching.
     private val habituation = ObstacleHabituation()
+    // Camera tamper / occlusion / knocked-off-mount warning state.
+    @Volatile private var lastCamHealth = CameraHealth.OK
+    private var lastCamNagMs = 0L
+    private val CAM_NAG_MS = 7_000L
     // Overhead / head-height hazard channel (Bible §3) — edge-triggered.
     @Volatile private var lastOverhead = false
     // Double-tap "what's around me" scene description.
@@ -323,9 +328,18 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Calibration cleared", Toast.LENGTH_SHORT).show()
             } else {
                 calibration.capture(lastCenterProximity)
+                // Also define "level" for the mount: capture the CURRENT pose as vertical so
+                // the camera-health monitor judges tilt relative to how the wearer set it up,
+                // not an auto-guess. Hold the phone perfectly vertical when tapping this.
+                EngineConfig.imuTracker?.calibrateMountingOffset()
+                habituation.reset()
+                speakLocalized(
+                    if (langPrefs.speakHindi) "कैमरा कोण सीधा सेट किया गया" else "Camera angle set to vertical",
+                    langPrefs.speakHindi, TextToSpeech.QUEUE_FLUSH, "camcal",
+                )
                 Toast.makeText(
                     this,
-                    "Calibrated forward baseline @ %.2f".format(lastCenterProximity),
+                    "Calibrated: forward @ %.2f + mount angle = vertical".format(lastCenterProximity),
                     Toast.LENGTH_SHORT,
                 ).show()
             }
@@ -389,6 +403,16 @@ class MainActivity : AppCompatActivity() {
 
         binding.btnDebugPanel.setOnClickListener {
             startActivity(android.content.Intent(this, DebugActivity::class.java))
+        }
+
+        // Path B — AR room scan (experimental). Isolated activity; owns the camera via ARCore.
+        binding.btnRoomScan.setOnClickListener {
+            when (ai.secondsense.app.ar.ArSupport.availability(this)) {
+                ai.secondsense.app.ar.ArSupport.State.UNSUPPORTED ->
+                    Toast.makeText(this, "This device isn't AR-capable — room scan unavailable", Toast.LENGTH_LONG).show()
+                else ->
+                    startActivity(android.content.Intent(this, ai.secondsense.app.ar.RoomScanActivity::class.java))
+            }
         }
 
         startDashboardServer()
@@ -518,6 +542,32 @@ class MainActivity : AppCompatActivity() {
         return super.dispatchTouchEvent(ev)
     }
 
+    /**
+     * Tell the wearer (they can't see the screen) when the camera is covered or knocked off
+     * its mount, and again every [CAM_NAG_MS] while it stays bad. Announce recovery once.
+     */
+    private fun handleCameraHealth(h: CameraHealth) {
+        val bad = h == CameraHealth.BLOCKED || h == CameraHealth.MISALIGNED
+        val wasBad = lastCamHealth == CameraHealth.BLOCKED || lastCamHealth == CameraHealth.MISALIGNED
+        val now = System.currentTimeMillis()
+        val hi = langPrefs.speakHindi
+        if (bad && (!wasBad || h != lastCamHealth || now - lastCamNagMs > CAM_NAG_MS)) {
+            lastCamNagMs = now
+            val msg = when (h) {
+                CameraHealth.BLOCKED ->
+                    if (hi) "कैमरा ढका हुआ है, कृपया इसे साफ़ करें" else "Camera is blocked. Please clear it."
+                CameraHealth.MISALIGNED ->
+                    if (hi) "कैमरा हिल गया है, कृपया इसे सीधा करें" else "Camera has moved. Please straighten it."
+                else -> ""
+            }
+            speakLocalized(msg, hi, TextToSpeech.QUEUE_FLUSH, "camhealth")
+        } else if (!bad && wasBad) {
+            speakLocalized(if (hi) "कैमरा ठीक है" else "Camera is okay now", hi, TextToSpeech.QUEUE_ADD, "camhealth")
+            haptics.testBuzz()
+        }
+        lastCamHealth = h
+    }
+
     /** Double-tap handler: speak a one-sentence description of the current frame (offline). */
     private fun narrateScene() {
         val text = SceneNarrator.describe(lastResult)
@@ -639,6 +689,8 @@ class MainActivity : AppCompatActivity() {
         val result = raw.copy(detections = stabilizer.update(raw.detections))
         lastResult = result
 
+        handleCameraHealth(result.cameraHealth)
+
         // OBJECT MEMORY: a named object just came to rest in view -> log where it is, in the
         // dead-reckoned local frame. Cheap; only consulted by a later "where is my X" query.
         result.settledObject?.let { s ->
@@ -759,8 +811,12 @@ class MainActivity : AppCompatActivity() {
         // are edge-triggered haptics and bypass this entirely.
         val gatedObstacle = habituation.filter(obstacleTarget, pedometer.isWalking, System.currentTimeMillis())
         // A visible, not-yet-reached voice goal wins; then a remembered object's bearing;
-        // otherwise the (habituation-gated) obstacle spine (#22).
-        val target = goalCue ?: memoryCue ?: gatedObstacle
+        // otherwise the (habituation-gated) obstacle spine (#22). When the camera is blocked
+        // or off its mount, EVERY vision-derived cue is suspect — go silent on the spine and
+        // let handleCameraHealth() do the talking (the SENSOR_BLOCKED hazard path still fires
+        // its own "path blocked" haptic).
+        val camUsable = result.cameraHealth == CameraHealth.OK || result.cameraHealth == CameraHealth.DIM
+        val target = if (!camUsable) null else goalCue ?: memoryCue ?: gatedObstacle
         if (sonifying) cueEngine.update(target)
         publishDashboardState(result, target)
 
@@ -785,6 +841,9 @@ class MainActivity : AppCompatActivity() {
                     append(if (memoryNavActive) "   → ${vectorToGoal.activeGoal}\n" else "\n")
                 }
                 if (overhead) append("⚠ OVERHEAD / HEAD-HEIGHT HAZARD\n")
+                if (result.cameraHealth != CameraHealth.OK) append("⚠ CAMERA: ${result.cameraHealth}\n")
+                if (EngineConfig.imuTracker?.hasMountCalibration != true)
+                    append("cam angle: not calibrated (hold vertical, tap Calibrate)\n")
                 if (habituation.muted) append("obstacle cue: muted (static, not approaching)\n")
                 append("baro: ${if (!barometer.isAvailable) "no sensor on this device" else "trend=%.3f hPa".format(barometer.pressureTrendHpa() ?: 0f)}\n")
                 if (hazardDetector.isReady) {

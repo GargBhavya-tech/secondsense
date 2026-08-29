@@ -43,13 +43,22 @@ object EngineConfig {
     var imuTracker: ImuTracker? = null
         private set
 
+    /**
+     * The engine handed out by the most recent [create]. RoomScanActivity borrows this
+     * (rather than building a 2nd engine — that would load a second ~300 MB model set and a
+     * second NPU session). Safe because the room scan and the live-nav camera never run at
+     * once: MainActivity's CameraX is lifecycle-stopped while RoomScanActivity is foreground,
+     * so the engine is idle. Null before the first create / after MainActivity.onDestroy.
+     */
+    @Volatile var lastCreated: InferenceEngine? = null
+
     fun create(context: Context): InferenceEngine {
         // Stop any tracker left over from a previous create() (e.g. an Activity recreate after
         // process death) before replacing the reference, so its SensorManager listener
         // registration isn't leaked.
         imuTracker?.stop()
         imuTracker = ImuTracker(context.applicationContext)
-        return when (KIND) {
+        val engine = when (KIND) {
         Kind.MOCK -> MockInferenceEngine()
 
         Kind.TFLITE ->
@@ -115,6 +124,8 @@ object EngineConfig {
             }
         }
         }
+        lastCreated = engine
+        return engine
     }
 
     private fun assetExists(context: Context, path: String): Boolean = try {

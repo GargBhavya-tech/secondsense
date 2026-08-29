@@ -8,6 +8,7 @@
     <string name="mode_scan_seek">Scan/seek mode — stopped, exploring (#25)</string>
     <string name="speak_hindi">Speak in Hindi (हिंदी में सुनें)</string>
     <string name="translate_signs">Translate signs to my language</string>
+    <string name="room_scan">Room scan (AR, experimental)</string>
     <string name="calibrate">Calibrate (1-tap baseline) (#7)</string>
     <string name="find_voice">Find… (voice) (#26)</string>
     <string name="debug_panel">Debug Panel — test one thing at a time</string>
