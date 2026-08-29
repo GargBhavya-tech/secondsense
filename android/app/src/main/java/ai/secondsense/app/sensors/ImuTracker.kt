@@ -8,6 +8,8 @@ import android.hardware.SensorManager
 import kotlin.math.atan2
 import kotlin.math.sqrt
 
+private const val DEG_PER_RAD = 57.29578f
+
 /**
  * V3 drop-off plan §1 — time-synchronized gyroscope + accelerometer fusion via a complementary
  * filter, producing pitch/roll for [ai.secondsense.app.inference.decode.TraversableCorridor]
@@ -45,6 +47,23 @@ class ImuTracker(context: Context) : SensorEventListener {
     var angularVelocityDegPerSec: Float = 0f
         private set
 
+    /**
+     * Heading / yaw in degrees, 0..360, monotonic with the user turning their body.
+     *
+     * Derived by projecting the gyro's angular-rate vector onto the gravity (down) axis and
+     * integrating — i.e. "how fast are we rotating about vertical, right now". This is
+     * MOUNT-AGNOSTIC: it works with the phone flat, upright on the chest, or anywhere between,
+     * unlike getOrientation()'s azimuth which degenerates near vertical. No magnetometer, so
+     * the ABSOLUTE value is arbitrary (no true north) and it drifts a few deg/min — only
+     * *differences* over the ~1-minute object-memory window are used, so that's acceptable.
+     */
+    var headingDeg: Float = 0f
+        private set
+
+    /** True once a heading source has produced at least one sample. */
+    var hasHeading: Boolean = false
+        private set
+
     /** True during fast rotation (whip-pan, stumble) — callers should hold/degrade rather than
      * trust a fresh vision read, per the plan's explicit guidance. */
     val isHighRotation: Boolean get() = angularVelocityDegPerSec > HIGH_ROTATION_THRESHOLD_DEG_S
@@ -56,6 +75,11 @@ class ImuTracker(context: Context) : SensorEventListener {
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val gyro = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
     private val accel = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+
+    // Low-passed gravity direction (device frame) — the axis we project gyro yaw onto.
+    private var gravX = 0f
+    private var gravY = 0f
+    private var gravZ = 9.81f
 
     private var lastGyroTimestampNs: Long = 0L
     private var accelPitchRaw = 0f
@@ -86,6 +110,10 @@ class ImuTracker(context: Context) : SensorEventListener {
         when (event.sensor.type) {
             Sensor.TYPE_ACCELEROMETER -> {
                 val (ax, ay, az) = event.values
+                // Low-pass toward gravity so the yaw projection has a stable "down" axis.
+                gravX += 0.1f * (ax - gravX)
+                gravY += 0.1f * (ay - gravY)
+                gravZ += 0.1f * (az - gravZ)
                 // Standard phone-frame formula: pitch from forward/back tilt, roll from side tilt.
                 accelPitchRaw = Math.toDegrees(
                     atan2(-ax.toDouble(), sqrt((ay * ay + az * az).toDouble()))
@@ -102,7 +130,7 @@ class ImuTracker(context: Context) : SensorEventListener {
                 }
             }
             Sensor.TYPE_GYROSCOPE -> {
-                val (gx, gy, _) = event.values
+                val (gx, gy, gz) = event.values
                 angularVelocityDegPerSec = Math.toDegrees(
                     sqrt((gx * gx + gy * gy).toDouble())
                 ).toFloat()
@@ -110,6 +138,16 @@ class ImuTracker(context: Context) : SensorEventListener {
                 if (lastGyroTimestampNs != 0L && hasValidReading) {
                     val dt = (event.timestamp - lastGyroTimestampNs) / 1_000_000_000f
                     if (dt in 0f..0.5f) { // ignore absurd gaps (sensor pause/resume)
+                        // Heading: angular-rate projected onto the gravity (down) axis and
+                        // integrated. Mount-agnostic — no getOrientation() gimbal issue.
+                        val gMag = sqrt(
+                            (gravX * gravX + gravY * gravY + gravZ * gravZ).toDouble()
+                        ).toFloat()
+                        if (gMag > 1f) {
+                            val yawRate = (gx * gravX + gy * gravY + gz * gravZ) / gMag // rad/s about down
+                            headingDeg = ((headingDeg + yawRate * dt * DEG_PER_RAD) % 360f + 360f) % 360f
+                            hasHeading = true
+                        }
                         // Integrate gyro for the short-term estimate, complementary-blend with
                         // the accelerometer's gravity-derived (drift-free but noisy) estimate.
                         val gyroPitch = pitchDeg + Math.toDegrees((gx * dt).toDouble()).toFloat()

@@ -67,6 +67,23 @@ data class Detection(
 )
 
 /**
+ * A named object that just came to REST in view this frame — the trigger for logging it into
+ * short-horizon episodic memory (the "where are my keys" feature). Emitted by
+ * [ai.secondsense.app.inference.decode.RestingStateVerifier] via [SceneAnalyzer].
+ *
+ * @param label      object class (icon vocab).
+ * @param distanceM  ROUGH metric distance estimate — see [ai.secondsense.app.inference.decode.MetricDepthScaler]
+ *                   for why this is an estimate, not a measurement.
+ * @param bearingDeg horizontal bearing from the camera's forward axis: 0 = dead ahead,
+ *                   negative = left, positive = right. Derived from box centre + assumed FOV.
+ */
+data class SettledSighting(
+    val label: String,
+    val distanceM: Float,
+    val bearingDeg: Float,
+)
+
+/**
  * The full result of running inference on one frame. The engine returns this;
  * the app renders/sonifies it. `depthAvailable` lets the RED tier fire (proximity
  * without identity) even when detection returns nothing.
@@ -122,4 +139,10 @@ data class FrameResult(
     val hazardConfidence: Float? = null,
     val hazardUrgency: Float? = null,
     val hazardFirstEdgeY: Float? = null,
+    /**
+     * A named object that settled into a resting state in view this frame — feeds
+     * short-horizon episodic memory ("where are my keys"). Null on frames where nothing new
+     * settled, and always null on the mock engine. See [SettledSighting].
+     */
+    val settledObject: SettledSighting? = null,
 )

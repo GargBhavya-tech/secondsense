@@ -23,6 +23,12 @@ import ai.secondsense.app.inference.decode.DetectionStabilizer
 import ai.secondsense.app.perception.LanguagePrefs
 import ai.secondsense.app.perception.MlKitPerception
 import ai.secondsense.app.perception.OcrTranslator
+import ai.secondsense.app.memory.DeadReckoner
+import ai.secondsense.app.memory.MemoryPhrase
+import ai.secondsense.app.memory.ObjectMemory
+import ai.secondsense.app.sensors.PedometerTracker
+import ai.secondsense.app.sonification.CueTarget
+import ai.secondsense.app.sonification.ObstacleHabituation
 import java.util.Locale
 import ai.secondsense.app.voice.SceneNarrator
 import ai.secondsense.app.dashboard.DashboardServer
@@ -121,6 +127,8 @@ class MainActivity : AppCompatActivity() {
 
     // Accuracy: multi-frame detection-confidence stabilization (no model change).
     private val stabilizer = DetectionStabilizer()
+    // Stop nagging about a static obstacle the user is standing near but not approaching.
+    private val habituation = ObstacleHabituation()
     // Overhead / head-height hazard channel (Bible §3) — edge-triggered.
     @Volatile private var lastOverhead = false
     // Double-tap "what's around me" scene description.
@@ -132,6 +140,18 @@ class MainActivity : AppCompatActivity() {
     // Spoken-language preference (English / Hindi) + on-device Hindi<->English translation.
     private val langPrefs by lazy { LanguagePrefs(this) }
     private val translator by lazy { OcrTranslator() }
+
+    // Episodic object memory ("where are my keys") — no SLAM. Pedometer + IMU heading feed a
+    // drifting local-frame dead-reckoner; settled sightings from SceneAnalyzer land in
+    // ObjectMemory; a voice "where is my X" reads back a coarse bearing and steers to it until
+    // the object re-enters the camera (then the live goal-seek takes over).
+    private val pedometer by lazy { PedometerTracker(this) }
+    private val deadReckoner = DeadReckoner()
+    private val objectMemory = ObjectMemory()
+    @Volatile private var memoryNavActive = false
+
+    private fun currentPose(): DeadReckoner.Pose =
+        deadReckoner.pose(EngineConfig.imuTracker?.headingDeg ?: 0f)
 
     // ML Kit (offline): OCR sign-reading (Latin + Devanagari) + "person facing you".
     private val perception by lazy {
@@ -281,6 +301,7 @@ class MainActivity : AppCompatActivity() {
         // The controller is the single source of truth; it drives the analyzer.
         modeController.addListener { mode ->
             analyzer.centerCrop = (mode == OperatingMode.FLOW)
+            habituation.reset()   // a mode switch is a fresh intent — re-alert obstacles
             runOnUiThread { binding.switchCenterCrop.isChecked = analyzer.centerCrop }
         }
         binding.switchMode.setOnCheckedChangeListener { _, checked ->
@@ -343,6 +364,12 @@ class MainActivity : AppCompatActivity() {
         }
         // One-time Hindi<->English translation model fetch (Wi-Fi only); no-op once cached.
         translator.prewarm()
+
+        // Object-memory dead-reckoning: advance the local-frame position one stride per step,
+        // along the heading at that instant.
+        pedometer.onStep = {
+            deadReckoner.onStep(EngineConfig.imuTracker?.headingDeg ?: 0f, pedometer.strideMeters)
+        }
         sceneGestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
             override fun onDoubleTap(e: MotionEvent): Boolean { narrateScene(); return true }
@@ -512,8 +539,12 @@ class MainActivity : AppCompatActivity() {
         // on the same source (this capture) fails on many devices. Pause hazard listening for
         // the short capture window, then restart it.
         hazardDetector.stop()
-        voiceCapture.capture { noun, _, recognizerReady ->
+        voiceCapture.capture { noun, transcript, recognizerReady ->
             if (hasMicPermission()) startHazardDetection()
+            // "where is my X" / "where's my X" -> recall from memory; anything else -> live seek.
+            val isRecall = transcript?.lowercase()?.let {
+                it.contains("where") || it.contains("last seen") || it.contains("did i leave")
+            } == true
             runOnUiThread {
                 when {
                     !recognizerReady -> Toast.makeText(
@@ -522,13 +553,40 @@ class MainActivity : AppCompatActivity() {
                         Toast.LENGTH_LONG,
                     ).show()
                     noun == null -> Toast.makeText(this, "Didn't catch a target", Toast.LENGTH_SHORT).show()
+                    isRecall -> recallObject(noun)
                     else -> {
                         vectorToGoal.setGoal(noun)
+                        memoryNavActive = false
                         binding.switchSonify.isChecked = true   // ensure the cue loop is running to steer
                         Toast.makeText(this, "Goal set: $noun", Toast.LENGTH_SHORT).show()
                     }
                 }
             }
+        }
+    }
+
+    /** Answer "where is my <noun>" from short-horizon memory, then steer toward the bearing. */
+    private fun recallObject(noun: String) {
+        val hit = objectMemory.recall(noun, currentPose(), System.currentTimeMillis())
+        if (hit == null) {
+            speakMemory("I don't have a memory of your $noun yet. I only remember things I've seen you set down.")
+            return
+        }
+        speakMemory(MemoryPhrase.build(noun, hit))
+        vectorToGoal.setGoal(noun)
+        memoryNavActive = true
+        binding.switchSonify.isChecked = true
+        Toast.makeText(this, "🧠 ${MemoryPhrase.build(noun, hit)}", Toast.LENGTH_LONG).show()
+    }
+
+    /** Speak a memory sentence, translating to Hindi first when that's the preference. */
+    private fun speakMemory(english: String) {
+        if (langPrefs.speakHindi && langPrefs.translateSigns) {
+            translator.localize(english, sourceIsDevanagari = false, wantHindi = true, translateEnabled = true) { spoken, isHi ->
+                speakLocalized(spoken, isHi, TextToSpeech.QUEUE_FLUSH, "mem")
+            }
+        } else {
+            speakLocalized(english, langPrefs.speakHindi, TextToSpeech.QUEUE_FLUSH, "mem")
         }
     }
 
@@ -580,6 +638,16 @@ class MainActivity : AppCompatActivity() {
         // detections, hold down one-frame flickers. Engine-agnostic post-processing.
         val result = raw.copy(detections = stabilizer.update(raw.detections))
         lastResult = result
+
+        // OBJECT MEMORY: a named object just came to rest in view -> log where it is, in the
+        // dead-reckoned local frame. Cheap; only consulted by a later "where is my X" query.
+        result.settledObject?.let { s ->
+            objectMemory.remember(s, currentPose(), System.currentTimeMillis())
+            android.util.Log.i(
+                "SecondSense/memory",
+                "logged %s ~%.1fm @%.0f° (mem=%d)".format(s.label, s.distanceM, s.bearingDeg, objectMemory.size),
+            )
+        }
 
         // OVERHEAD / head-height hazard (Bible §3, the #1 differentiator): a close object whose
         // WHOLE box sits high in the frame is exactly the cane's blind spot. Distinct cue, on
@@ -653,6 +721,30 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // MEMORY NAV: when steering to a REMEMBERED object, cue its dead-reckoned bearing
+        // until it re-enters the camera — at which point goalMatch above fires and the live
+        // visual cue takes over (the "visual handoff"). Lower priority than a live match.
+        if (goalMatch != null && memoryNavActive) memoryNavActive = false
+        val memoryCue: CueTarget? = if (memoryNavActive && goalCue == null) {
+            val hit = objectMemory.recall(vectorToGoal.activeGoal, currentPose(), System.currentTimeMillis())
+            when {
+                hit == null -> { memoryNavActive = false; null }
+                hit.distanceM < 0.8f -> {
+                    memoryNavActive = false
+                    val g = vectorToGoal.activeGoal ?: "it"
+                    vectorToGoal.setGoal(null)
+                    speakMemory("You should be right next to your $g. I can't see it yet.")
+                    null
+                }
+                else -> CueTarget(
+                    azimuth = (hit.bearingDeg.coerceIn(-90f, 90f) / 90f) * 0.5f + 0.5f,
+                    proximity = (1f - hit.distanceM / 6f).coerceIn(0.12f, 0.60f),
+                    label = hit.label,
+                    tier = ai.secondsense.app.inference.ConfidenceTier.BLUE,
+                )
+            }
+        } else null
+
         // TARGETING (#14/#15) + TIER DERIVATION (#23): resolve the frame to the single
         // thing to cue, and stamp a smoothed, signal-derived confidence tier onto it.
         val rawTarget = targetSelector.selectWithTier(result, tierClassifier)
@@ -662,8 +754,13 @@ class MainActivity : AppCompatActivity() {
         // uncalibrated). #16: gate on ~3-frame persistence so flicker never fires a cue.
         val calibrated = rawTarget?.copy(proximity = calibration.apply(rawTarget.proximity))
         val obstacleTarget = temporalSmoother.update(calibrated)
-        // A visible, not-yet-reached voice goal wins; otherwise the obstacle spine (#22).
-        val target = goalCue ?: obstacleTarget
+        // Habituation: once a static obstacle has been announced and the user isn't closing on
+        // it, stop cueing it until the situation changes. Safety hazards (drop-off / overhead)
+        // are edge-triggered haptics and bypass this entirely.
+        val gatedObstacle = habituation.filter(obstacleTarget, pedometer.isWalking, System.currentTimeMillis())
+        // A visible, not-yet-reached voice goal wins; then a remembered object's bearing;
+        // otherwise the (habituation-gated) obstacle spine (#22).
+        val target = goalCue ?: memoryCue ?: gatedObstacle
         if (sonifying) cueEngine.update(target)
         publishDashboardState(result, target)
 
@@ -682,7 +779,13 @@ class MainActivity : AppCompatActivity() {
                 append("frames: $frameCount   infer: ${lastInferenceMs}ms\n")
                 append("dets: ${result.detections.size}   crop: ${analyzer.centerCrop}   son: $sonifying\n")
                 append("cal: ${if (calibration.isCalibrated) "on@%.2f".format(calibration.baselineValue ?: 0f) else "off"}\n")
+                run {
+                    val p = currentPose()
+                    append("mem: ${objectMemory.size} obj   steps: ${pedometer.stepCount}   dr: x=%.1f z=%.1f hdg=%.0f°".format(p.x, p.z, p.headingDeg))
+                    append(if (memoryNavActive) "   → ${vectorToGoal.activeGoal}\n" else "\n")
+                }
                 if (overhead) append("⚠ OVERHEAD / HEAD-HEIGHT HAZARD\n")
+                if (habituation.muted) append("obstacle cue: muted (static, not approaching)\n")
                 append("baro: ${if (!barometer.isAvailable) "no sensor on this device" else "trend=%.3f hPa".format(barometer.pressureTrendHpa() ?: 0f)}\n")
                 if (hazardDetector.isReady) {
                     append("hazard listen: ${lastHazardSampleLabel ?: "—"} (%.2f)\n".format(lastHazardSampleScore))
@@ -748,14 +851,17 @@ class MainActivity : AppCompatActivity() {
         cueEngine.stop()
         cueEngine.update(null)
         EngineConfig.imuTracker?.stop()
+        pedometer.stop()
         barometer.stop()
         hazardDetector.stop()
         stabilizer.reset()   // camera pauses -> tracks would go stale
+        habituation.reset()
     }
 
     override fun onResume() {
         super.onResume()
         EngineConfig.imuTracker?.start()
+        pedometer.start()
         barometer.start()
         if (sonifying) cueEngine.start()
         if (hasMicPermission()) startHazardDetection()

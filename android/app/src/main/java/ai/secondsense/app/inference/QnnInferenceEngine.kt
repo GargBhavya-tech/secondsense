@@ -121,6 +121,7 @@ class QnnInferenceEngine(
             hazardConfidence = scene.hazardConfidence,
             hazardUrgency = scene.hazardUrgency,
             hazardFirstEdgeY = scene.hazardFirstEdgeY,
+            settledObject = scene.settledObject,
         )
     }
 

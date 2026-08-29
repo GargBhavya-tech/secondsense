@@ -2,6 +2,7 @@ package ai.secondsense.app.inference.decode
 
 import android.graphics.Bitmap
 import ai.secondsense.app.inference.Detection
+import ai.secondsense.app.inference.SettledSighting
 import ai.secondsense.app.sensors.ImuTracker
 
 /**
@@ -27,6 +28,11 @@ class SceneAnalyzer(
     private val motion = MotionTracker()
     private val groundPlaneAnalyzer = GroundPlaneAnalyzer()
     private val hazardStateMachine = HazardStateMachine()
+    // Object-memory support: rough metric distance + a "has it come to rest" gate. Always on
+    // (cheap on the small depth grid); their output only matters once MainActivity wires the
+    // memory feature, and is harmless otherwise.
+    private val metricScaler = MetricDepthScaler()
+    private val restingVerifier = RestingStateVerifier()
 
     private var prevGray: FloatArray? = null
     private var tick = 0L
@@ -41,6 +47,7 @@ class SceneAnalyzer(
         val hazardFirstEdgeY: Float?,
         val egoMotionX: Float,
         val egoMotionY: Float,
+        val settledObject: SettledSighting? = null,
     )
 
     fun analyze(frame: Bitmap, depthFrame: DepthSampler.Frame, detections: List<Detection>): Result {
@@ -87,8 +94,22 @@ class SceneAnalyzer(
         }
         lastEvidence = evidence
 
-        val hz = hazardStateMachine.update(evidence, System.currentTimeMillis())
+        val nowMs = System.currentTimeMillis()
+        val hz = hazardStateMachine.update(evidence, nowMs)
         val annotated = motion.annotate(detections, ego)
+
+        // Object-memory: keep the floor->metric fit fresh (throttled), tag each named
+        // detection with a rough distance, and ask whether any has come to rest.
+        if (runHeavy) {
+            metricScaler.updateFloorFit(
+                depthFrame, corridor,
+                imuTracker?.pitchDeg ?: 0f, imuTracker?.rollDeg ?: 0f,
+            )
+        }
+        val namedWithDist = annotated.mapNotNull { d ->
+            if (d.label == null) null else d to metricScaler.metersForBox(depthFrame, d.box)
+        }
+        val settled = restingVerifier.update(namedWithDist, nowMs).firstOrNull()
 
         return Result(
             detections = annotated,
@@ -98,12 +119,15 @@ class SceneAnalyzer(
             hazardFirstEdgeY = hz.firstEdgeY,
             egoMotionX = ego.first,
             egoMotionY = ego.second,
+            settledObject = settled,
         )
     }
 
     fun reset() {
         motion.reset()
         hazardStateMachine.reset()
+        metricScaler.reset()
+        restingVerifier.reset()
         prevGray = null
         tick = 0L
         lastEvidence = null
