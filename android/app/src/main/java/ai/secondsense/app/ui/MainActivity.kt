@@ -20,7 +20,10 @@ import androidx.core.content.ContextCompat
 import ai.secondsense.app.audio.HazardSoundDetector
 import ai.secondsense.app.camera.FrameAnalyzer
 import ai.secondsense.app.inference.decode.DetectionStabilizer
+import ai.secondsense.app.perception.LanguagePrefs
 import ai.secondsense.app.perception.MlKitPerception
+import ai.secondsense.app.perception.OcrTranslator
+import java.util.Locale
 import ai.secondsense.app.voice.SceneNarrator
 import ai.secondsense.app.dashboard.DashboardServer
 import ai.secondsense.app.dashboard.QrCodeGenerator
@@ -123,18 +126,63 @@ class MainActivity : AppCompatActivity() {
     // Double-tap "what's around me" scene description.
     @Volatile private var lastResult: FrameResult? = null
     private var tts: TextToSpeech? = null
+    @Volatile private var ttsReady = false
     private var sceneGestures: GestureDetector? = null
 
-    // ML Kit (offline): OCR sign-reading + "person facing you". Fed the same camera frame.
+    // Spoken-language preference (English / Hindi) + on-device Hindi<->English translation.
+    private val langPrefs by lazy { LanguagePrefs(this) }
+    private val translator by lazy { OcrTranslator() }
+
+    // ML Kit (offline): OCR sign-reading (Latin + Devanagari) + "person facing you".
     private val perception by lazy {
         MlKitPerception(
-            onSign = { text -> runOnUiThread { speakAux("Sign: $text") } },
-            onFacingPerson = { runOnUiThread { speakAux("Person facing you"); haptics.testBuzz() } },
+            onSign = { text, isDeva -> onSignRead(text, isDeva) },
+            onFacingPerson = {
+                val hi = langPrefs.speakHindi
+                speakLocalized(
+                    if (hi) "सामने एक व्यक्ति आपकी ओर देख रहा है" else "Person facing you",
+                    hi,
+                    TextToSpeech.QUEUE_ADD,
+                    "aux",
+                )
+                haptics.testBuzz()
+            },
         )
     }
-    private fun speakAux(text: String) {
-        tts?.speak(text, TextToSpeech.QUEUE_ADD, null, "aux")
-        Toast.makeText(this, "🔊 $text", Toast.LENGTH_SHORT).show()
+
+    /** A sign was OCR'd — translate to the listener's language if needed, then speak it. */
+    private fun onSignRead(text: String, isDevanagari: Boolean) {
+        translator.localize(
+            text = text,
+            sourceIsDevanagari = isDevanagari,
+            wantHindi = langPrefs.speakHindi,
+            translateEnabled = langPrefs.translateSigns,
+        ) { spoken, isHindi ->
+            speakLocalized((if (isHindi) "साइन: " else "Sign: ") + spoken, isHindi, TextToSpeech.QUEUE_ADD, "aux")
+        }
+    }
+
+    /**
+     * Speak [text] in Hindi (hi-IN) or English, switching the TTS voice per call. Falls back to
+     * the default voice if no Hindi data is installed (glyphs still spoken, just accented).
+     */
+    private fun speakLocalized(text: String, hindi: Boolean, queueMode: Int, utteranceId: String) {
+        runOnUiThread {
+            val t = tts
+            val spoke = if (t != null && ttsReady) {
+                val r = t.setLanguage(if (hindi) Locale("hi", "IN") else Locale.US)
+                if (hindi && (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED)) {
+                    t.setLanguage(Locale.US)
+                }
+                t.speak(text, queueMode, null, utteranceId)
+            } else {
+                TextToSpeech.ERROR
+            }
+            Toast.makeText(this, "🔊 $text", Toast.LENGTH_SHORT).show()
+            if (spoke != TextToSpeech.SUCCESS) {
+                Toast.makeText(this, "(no TTS voice — install one in Settings › Text-to-speech)", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
     @Volatile private var lastPossibleDropAtMs = 0L
     private val POSSIBLE_DROP_COOLDOWN_MS = 1500L
@@ -272,8 +320,29 @@ class MainActivity : AppCompatActivity() {
         // cueEngine.start(). Toggle off in-app if you need silence during setup.
         binding.switchSonify.isChecked = true
 
+        // Spoken-language preference — English (default) or Hindi. Controls the TTS voice for
+        // every cue the app speaks (sign read-outs, scene description, "person facing you").
+        binding.switchHindi.isChecked = langPrefs.speakHindi
+        binding.switchHindi.setOnCheckedChangeListener { _, checked ->
+            langPrefs.speakHindi = checked
+            speakLocalized(if (checked) "अब हिंदी में" else "English now", checked, TextToSpeech.QUEUE_FLUSH, "lang")
+        }
+        // When a sign's script differs from that preference, translate it before speaking
+        // (Hindi<->English, on-device). Off = always read the sign in its printed script.
+        binding.switchTranslate.isChecked = langPrefs.translateSigns
+        binding.switchTranslate.setOnCheckedChangeListener { _, checked ->
+            langPrefs.translateSigns = checked
+        }
+
         // Double-tap the camera preview -> speak "what's around me" (offline, no LLM).
-        tts = TextToSpeech(this) {}
+        tts = TextToSpeech(this) { status ->
+            ttsReady = status == TextToSpeech.SUCCESS
+            if (ttsReady) {
+                tts?.setLanguage(if (langPrefs.speakHindi) Locale("hi", "IN") else Locale.US)
+            }
+        }
+        // One-time Hindi<->English translation model fetch (Wi-Fi only); no-op once cached.
+        translator.prewarm()
         sceneGestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
             override fun onDoubleTap(e: MotionEvent): Boolean { narrateScene(); return true }
@@ -426,12 +495,14 @@ class MainActivity : AppCompatActivity() {
     private fun narrateScene() {
         val text = SceneNarrator.describe(lastResult)
         android.util.Log.i("SecondSense/scene", "narrateScene: \"$text\" (tts=${tts != null})")
-        val spoke = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "scene")
-        runOnUiThread {
-            Toast.makeText(this, "🔊 $text", Toast.LENGTH_LONG).show()
-            if (spoke != TextToSpeech.SUCCESS) {
-                Toast.makeText(this, "(no TTS voice — install one in Settings › Text-to-speech)", Toast.LENGTH_SHORT).show()
+        if (langPrefs.speakHindi && langPrefs.translateSigns) {
+            // SceneNarrator emits English — route it through en->hi so it's spoken in Hindi
+            // (falls back to the English sentence if the model pair isn't downloaded).
+            translator.localize(text, sourceIsDevanagari = false, wantHindi = true, translateEnabled = true) { spoken, isHindi ->
+                speakLocalized(spoken, isHindi, TextToSpeech.QUEUE_FLUSH, "scene")
             }
+        } else {
+            speakLocalized(text, langPrefs.speakHindi, TextToSpeech.QUEUE_FLUSH, "scene")
         }
     }
 
@@ -714,5 +785,6 @@ class MainActivity : AppCompatActivity() {
         hazardDetector.close()
         tts?.run { stop(); shutdown() }
         runCatching { perception.close() }
+        runCatching { translator.close() }
     }
 }

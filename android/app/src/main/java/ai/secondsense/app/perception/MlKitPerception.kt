@@ -6,6 +6,8 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
+import com.google.mlkit.vision.text.devanagari.DevanagariTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -13,7 +15,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Two extra sensing modalities on the SAME camera frame, both fully OFFLINE (bundled ML Kit):
  *
  *  - **Sign / text reading (OCR)** — indoor story: "read the sign", room numbers, bus numbers,
- *    EXIT signs. Only center-of-frame text, debounced so it doesn't machine-gun the same sign.
+ *    EXIT signs. Two bundled recognizers run on ALTERNATING passes: Latin script and
+ *    Devanagari (Hindi — शौचालय / निकास / प्रवेश …). Only center-of-frame text, debounced so it
+ *    doesn't machine-gun the same sign. The callback reports which script matched so the
+ *    caller can pick a TTS locale / translate.
  *  - **"Person facing you"** — a social-navigation cue no competitor markets: a detected face
  *    whose head is turned toward the camera (small Euler-Y) and is close enough to matter.
  *
@@ -21,7 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * must never back up the real-time inference loop. Callbacks fire on the main thread.
  */
 class MlKitPerception(
-    private val onSign: (String) -> Unit,
+    private val onSign: (text: String, isDevanagari: Boolean) -> Unit,
     private val onFacingPerson: () -> Unit,
     private val processEvery: Int = 6,
     private val textCooldownMs: Long = 4_000L,
@@ -29,7 +34,10 @@ class MlKitPerception(
     private val facingMaxDeg: Float = 18f,
     private val minFaceFrac: Float = 0.02f,
 ) {
-    private val textClient = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    private val textClientLatin: TextRecognizer =
+        TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    private val textClientDevanagari: TextRecognizer =
+        TextRecognition.getClient(DevanagariTextRecognizerOptions.Builder().build())
     private val faceClient = FaceDetection.getClient(
         FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
@@ -41,6 +49,7 @@ class MlKitPerception(
     private var frameCounter = 0L
     private val textBusy = AtomicBoolean(false)
     private val faceBusy = AtomicBoolean(false)
+    private var useDevanagariNext = false
     private var lastText: String = ""
     private var lastTextAtMs = 0L
     private var lastFaceAtMs = 0L
@@ -55,7 +64,13 @@ class MlKitPerception(
 
         if (textBusy.compareAndSet(false, true)) {
             val copy = runCatching { frame.copy(cfg, false) }.getOrNull()
-            if (copy == null) textBusy.set(false) else runText(copy, w, h)
+            if (copy == null) {
+                textBusy.set(false)
+            } else {
+                val deva = useDevanagariNext
+                useDevanagariNext = !useDevanagariNext
+                runText(copy, w, h, deva)
+            }
         }
         if (faceBusy.compareAndSet(false, true)) {
             val copy = runCatching { frame.copy(cfg, false) }.getOrNull()
@@ -63,8 +78,9 @@ class MlKitPerception(
         }
     }
 
-    private fun runText(bmp: Bitmap, w: Int, h: Int) {
-        textClient.process(InputImage.fromBitmap(bmp, 0))
+    private fun runText(bmp: Bitmap, w: Int, h: Int, devanagari: Boolean) {
+        val client = if (devanagari) textClientDevanagari else textClientLatin
+        client.process(InputImage.fromBitmap(bmp, 0))
             .addOnSuccessListener { result ->
                 val center = StringBuilder()
                 for (block in result.textBlocks) {
@@ -78,15 +94,15 @@ class MlKitPerception(
                 }
                 val text = center.toString().trim()
                 val now = System.currentTimeMillis()
-                if (text.length >= 2 && text.any { it.isLetterOrDigit() } &&
-                    text != lastText && now - lastTextAtMs > textCooldownMs
-                ) {
+                val hasContent = text.length >= 2 &&
+                    text.any { it.isLetterOrDigit() || Character.UnicodeBlock.of(it) == DEVA_BLOCK }
+                if (hasContent && text != lastText && now - lastTextAtMs > textCooldownMs) {
                     lastText = text
                     lastTextAtMs = now
-                    onSign(text)
+                    onSign(text, devanagari)
                 }
             }
-            .addOnFailureListener { Log.w(TAG, "text: ${it.message}") }
+            .addOnFailureListener { Log.w(TAG, "text(${if (devanagari) "deva" else "latin"}): ${it.message}") }
             .addOnCompleteListener { bmp.recycle(); textBusy.set(false) }
     }
 
@@ -110,11 +126,13 @@ class MlKitPerception(
     }
 
     fun close() {
-        runCatching { textClient.close() }
+        runCatching { textClientLatin.close() }
+        runCatching { textClientDevanagari.close() }
         runCatching { faceClient.close() }
     }
 
     private companion object {
         const val TAG = "SecondSense/mlkit"
+        val DEVA_BLOCK: Character.UnicodeBlock = Character.UnicodeBlock.DEVANAGARI
     }
 }

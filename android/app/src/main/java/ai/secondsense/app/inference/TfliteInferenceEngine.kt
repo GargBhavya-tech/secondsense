@@ -15,6 +15,7 @@ import ai.secondsense.app.inference.decode.OpticalFlow
 import ai.secondsense.app.inference.decode.Preprocess
 import ai.secondsense.app.inference.decode.RawEvidence
 import ai.secondsense.app.inference.decode.RawTensor
+import ai.secondsense.app.inference.decode.SceneAnalyzer
 import ai.secondsense.app.inference.decode.TraversableCorridor
 import ai.secondsense.app.inference.decode.YoloDecoder
 import ai.secondsense.app.sensors.ImuTracker
@@ -76,26 +77,15 @@ class TfliteInferenceEngine(
 
     private var yoloInputSize = 640
     private val depthSampler = DepthSampler()
-    private val motion = MotionTracker()
-    // V2 (DropOffDetector's Sobel edge search + GroundPlaneAnalyzer.detect()'s OR-logic) was
-    // REMOVED from this engine per explicit user request, after it independently false-
-    // positived on a desk/keyboard scene alongside V3 — running two detectors built on the
-    // same underlying signal (monocular depth discontinuities) doesn't add real redundancy,
-    // it just doubles the false-positive surface. GroundPlaneAnalyzer.depthEvidence() (V3's
-    // depth-as-evidence channel) is a different method on the same class and is still used
-    // below; DropOffDetector.kt itself is now dead code (kept only because QnnInferenceEngine,
-    // unreachable in the current KIND=TFLITE build, still references it).
-    private val groundPlaneAnalyzer = GroundPlaneAnalyzer()
     // Research candidate (secondsense_research_candidates_v1.md §2) — EMA-smooths the raw
-    // depth map across consecutive depth-inference runs before anything else touches it
-    // (DepthSampler's percentile normalization, every downstream depth consumer). Validated
-    // offline: ~47% frame-to-frame noise reduction with negligible lag.
+    // depth map across consecutive depth-inference runs before anything else touches it.
     private val depthSmoother = DepthTemporalSmoother()
-    // V3 drop-off plan §7/§8 — fuses EdgeLattice (RGB) + GroundPlaneAnalyzer.depthEvidence
-    // (depth-as-evidence-not-veto) into the temporal SAFE/POSSIBLE_DROP/DROP_CONFIRMED state
-    // machine. Runs ALONGSIDE dropOffDetector/groundPlaneAnalyzer.detect() above (the existing
-    // V2 OR-logic), not replacing it — see the class doc comment for how both surface.
-    private val hazardStateMachine = HazardStateMachine()
+    // Shared with QnnInferenceEngine: per-frame ego-motion (Lucas-Kanade) + the V3 drop-off
+    // hazard fusion (EdgeLattice + GroundPlaneAnalyzer.depthEvidence + object-mask suppression
+    // -> HazardStateMachine) + the coarse moving/approaching annotation. hazardEveryN=2 runs
+    // the expensive RANSAC/Hough parts every other frame; the state machine still ticks every
+    // frame so its time-based decay is never skipped.
+    private val sceneAnalyzer = SceneAnalyzer(imuTracker, hazardEveryN = 2)
 
     @Volatile private var ready = false
 
@@ -254,51 +244,10 @@ class TfliteInferenceEngine(
             }
         }
 
-        // Research candidate (secondsense_research_candidates_v1.md §3) — camera ego-motion
-        // estimate via sparse Lucas-Kanade, so MotionTracker's `moving` flag reflects genuine
-        // object motion rather than the box shifting just because the camera panned.
-        val curGray = OpticalFlow.toGrayscale(frame, FLOW_GRAY_W, FLOW_GRAY_H)
-        val egoMotionNormalized = prevGray?.let { pg ->
-            val (dxPx, dyPx) = OpticalFlow.estimateEgoMotion(pg, curGray, FLOW_GRAY_W, FLOW_GRAY_H)
-            (dxPx / FLOW_GRAY_W) to (dyPx / FLOW_GRAY_H)
-        } ?: (0f to 0f)
-        prevGray = curGray
-
-        // V3 drop-off plan — hazard fusion. Reuses curGray (already computed above for
-        // ego-motion) rather than a second grayscale conversion. imuTracker being null (no
-        // sensor wiring at the call site) falls back to a fixed default corridor rather than
-        // crashing or skipping fusion entirely.
-        val corridor = TraversableCorridor.from(
-            imuTracker?.pitchDeg ?: 0f,
-            imuTracker?.rollDeg ?: 0f,
-        )
-        val latticeResult = EdgeLattice.detect(curGray, FLOW_GRAY_W, FLOW_GRAY_H, corridor)
-        val (depthVerdict, _) = groundPlaneAnalyzer.depthEvidence(depthFrame, corridor)
-        // Object-mask suppression — REAL FIX for the on-device desk/keyboard false positive
-        // (see GroundView's doc comment). Uses `detections` (this frame's fused YOLO
-        // detections, BEFORE the center-crop filter below) deliberately — the corridor spans
-        // the wide 15%-85% frame width, so restricting suppression to the narrower flow-mode
-        // crop would miss off-center furniture that's still inside the corridor.
-        val edgeBand = latticeResult.nearestRowFraction?.let { (it - 0.05f) to (it + 0.05f) }
-        val objectOverlap = edgeBand?.let { (lo, hi) -> GroundView.objectCoverage(detections, corridor, lo, hi) } ?: 0f
-        val nearFieldY1 = corridor.y1 + 0.6f * (corridor.y2 - corridor.y1)
-        val nearFieldObjectCoverage = GroundView.objectCoverage(detections, corridor, nearFieldY1, corridor.y2)
-        val hazardEvidence = RawEvidence(
-            latticeScore = latticeResult.score,
-            nearestEdgeY = latticeResult.nearestRowFraction,
-            depthVerdict = depthVerdict,
-            highRotation = imuTracker?.isHighRotation ?: false,
-            // Ambient-light sensing isn't wired for hazard sensing yet (deferred, same as the
-            // semantic classifier) — always false, an honest gap, not a fake reading.
-            lowLight = false,
-            sensorBlocked = false,
-            objectOverlap = objectOverlap,
-            nearFieldObjectCoverage = nearFieldObjectCoverage,
-        )
-        val hazardOutput = hazardStateMachine.update(hazardEvidence, System.currentTimeMillis())
-
-        // coarse motion signals (#15 / #13), now ego-motion-compensated
-        detections = motion.annotate(detections, egoMotionNormalized)
+        // Per-frame ego-motion (Lucas-Kanade) + V3 drop-off hazard fusion + coarse
+        // moving/approaching annotation — shared with QnnInferenceEngine, throttled inside.
+        val scene = sceneAnalyzer.analyze(frame, depthFrame, detections)
+        detections = scene.detections
 
         // center-crop filter — mirror the mock/contract: flow mode keeps only centered.
         val visible = if (centerCrop) detections.filter { abs(it.box.centerX - 0.5f) <= 0.15f } else detections
@@ -310,7 +259,7 @@ class TfliteInferenceEngine(
             val detSummary = visible.take(5).joinToString(" | ") {
                 "${it.label ?: "unk"} s=${"%.2f".format(it.score)} prox=${"%.2f".format(it.proximity)}"
             }.ifEmpty { "(none)" }
-            Log.i(TAG, "frame#$frameLog dets=${visible.size} hazard=${hazardOutput.state} ${elapsedMs}ms :: $detSummary")
+            Log.i(TAG, "frame#$frameLog dets=${visible.size} hazard=${scene.hazardState} ${elapsedMs}ms :: $detSummary")
         }
         return FrameResult(
             detections = visible,
@@ -323,12 +272,12 @@ class TfliteInferenceEngine(
             // drop-off signal. See the class-level doc comment on groundPlaneAnalyzer.
             debugRawCenterProximity = lastDebugRawCenterProx,
             debugSmoothedCenterProximity = lastDebugSmoothedCenterProx,
-            debugEgoMotionX = egoMotionNormalized.first,
-            debugEgoMotionY = egoMotionNormalized.second,
-            hazardState = hazardOutput.state,
-            hazardConfidence = hazardOutput.confidence,
-            hazardUrgency = hazardOutput.urgency,
-            hazardFirstEdgeY = hazardOutput.firstEdgeY,
+            debugEgoMotionX = scene.egoMotionX,
+            debugEgoMotionY = scene.egoMotionY,
+            hazardState = scene.hazardState,
+            hazardConfidence = scene.hazardConfidence,
+            hazardUrgency = scene.hazardUrgency,
+            hazardFirstEdgeY = scene.hazardFirstEdgeY,
         )
     }
 
@@ -339,10 +288,8 @@ class TfliteInferenceEngine(
         nnapiDelegates.forEach { runCatching { it.close() } }
         nnapiDelegates.clear()
         lastDepthFrame = null
-        motion.reset()
         depthSmoother.reset()
-        hazardStateMachine.reset()
-        prevGray = null
+        sceneAnalyzer.reset()
     }
 
     // ---- helpers -----------------------------------------------------------

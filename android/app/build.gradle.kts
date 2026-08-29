@@ -163,6 +163,13 @@ dependencies {
     // ---- ML Kit — bundled, fully OFFLINE (models ship in the APK, no Play Services fetch) --
     // Text recognition -> read signs / room numbers / bus numbers (Latin script).
     implementation("com.google.mlkit:text-recognition:16.0.1")
+    // Devanagari script recognition -> Hindi signs (शौचालय, निकास, प्रवेश, प्लेटफ़ॉर्म …).
+    // Bundled model, same offline guarantee as the Latin recognizer.
+    implementation("com.google.mlkit:text-recognition-devanagari:16.0.1")
+    // On-device translation (Hindi <-> English) so a Hindi sign can be spoken in the
+    // listener's preferred language. Model is fetched ONCE over Wi-Fi (~30 MB/pair) then
+    // fully offline; if it isn't downloaded yet we fall back to reading the native script.
+    implementation("com.google.mlkit:translate:17.0.3")
     // Face detection -> "person facing you" via head Euler-Y angle. Contour/classification off.
     implementation("com.google.mlkit:face-detection:16.1.7")
 
