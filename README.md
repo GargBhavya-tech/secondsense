@@ -1,5 +1,6 @@
 # SecondSense
 
+
 **On-device spatial-audio + haptic navigation for blind and low-vision users.**
 Fully offline, runs on a chest-mounted Android phone, zero recurring cost.
 Built for the iQOO Hackathon 2026 (Bengaluru City Battle, Aug 29–30).
@@ -207,5 +208,6 @@ If you want turnkey `git clone` -> build, add the model assets via **Git LFS** i
 
 *Prototype / hackathon project. Blindfolded-sighted testing is a proxy, not validation — real
 blind/low-vision co-design is the honest next step before any deployment.*
-#   s e c o n d s e n s e  
+#   s e c o n d s e n s e 
+ 
  

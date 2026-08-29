@@ -34,6 +34,20 @@ class VoiceCommandCapture(
         if (recording) return
         recording = true
         thread(name = "voice-capture") {
+            // Recognizers that run their own mic session (Android's SpeechRecognizer) don't
+            // want our PCM — hand them an empty buffer and let them capture.
+            if (recognizer.selfCaptures()) {
+                try {
+                    val ready = recognizer.isReady()
+                    val transcript = recognizer.transcribe(ShortArray(0), sampleRate)
+                    onResult(TargetNoun.extract(transcript), transcript, ready)
+                } catch (t: Throwable) {
+                    onResult(null, null, false)
+                } finally {
+                    recording = false
+                }
+                return@thread
+            }
             var recorder: AudioRecord? = null
             try {
                 val minBuf = AudioRecord.getMinBufferSize(

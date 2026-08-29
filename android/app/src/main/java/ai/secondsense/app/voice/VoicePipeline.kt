@@ -23,6 +23,11 @@ interface SpeechRecognizer {
     fun transcribe(pcm: ShortArray, sampleRate: Int): String?
     /** Release native/model resources. Default no-op. */
     fun release() {}
+    /**
+     * True if the recognizer runs its OWN mic session (e.g. Android's SpeechRecognizer) — then
+     * [VoiceCommandCapture] skips its PCM recording and passes an empty buffer to [transcribe].
+     */
+    fun selfCaptures(): Boolean = false
 }
 
 /** #27 — open-vocabulary grounding: locate an arbitrary named thing in a frame. */

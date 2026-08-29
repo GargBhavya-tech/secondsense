@@ -22,6 +22,14 @@
         android:name="android.hardware.camera.any"
         android:required="true" />
 
+    <!-- Android 11+ package visibility: lets AndroidSpeechRecognizer see the system
+         RecognitionService for the built-in (interim) voice ASR path. -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
@@ -29,6 +37,13 @@
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
         android:theme="@style/Theme.SecondSense">
+
+        <!-- QNN / Hexagon NPU: on Android 12+ an app must declare the vendor FastRPC libs it
+             dlopen()s to reach the cDSP, or the transport setup fails (QnnDsp err 4000).
+             required=false so non-QNN devices / the TFLITE build still install. -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+        <uses-native-library android:name="libadsprpc.so" android:required="false" />
+        <uses-native-library android:name="libsdsprpc.so" android:required="false" />
 
         <activity
             android:name=".ui.MainActivity"

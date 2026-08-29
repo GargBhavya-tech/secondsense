@@ -17,11 +17,21 @@ import android.content.Context
  * changes nothing above this line.
  */
 object VoiceRecognizers {
-    fun create(context: Context, fallback: SpeechRecognizer): SpeechRecognizer = try {
-        Class.forName("ai.secondsense.app.voice.SherpaKwsRecognizer")
-            .getConstructor(Context::class.java)
-            .newInstance(context.applicationContext) as SpeechRecognizer
-    } catch (_: Throwable) {
-        fallback
+    /**
+     * Preference order:
+     *   1. `SherpaKwsRecognizer` — guaranteed-offline, only if `-PenableSherpa` compiled it in.
+     *   2. `AndroidSpeechRecognizer` — the device's built-in on-device recognition, if present.
+     *   3. [fallback] — the QNN Whisper stub, which reports notReady honestly.
+     */
+    fun create(context: Context, fallback: SpeechRecognizer): SpeechRecognizer {
+        runCatching {
+            return Class.forName("ai.secondsense.app.voice.SherpaKwsRecognizer")
+                .getConstructor(Context::class.java)
+                .newInstance(context.applicationContext) as SpeechRecognizer
+        }
+        val builtin = AndroidSpeechRecognizer(context.applicationContext)
+        builtin.initialize()
+        if (builtin.isReady()) return builtin
+        return fallback
     }
 }

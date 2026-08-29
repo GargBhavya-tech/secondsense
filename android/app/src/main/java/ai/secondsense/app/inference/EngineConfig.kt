@@ -30,7 +30,7 @@ object EngineConfig {
      * secondsense_bible_v4_addendum_session4.md's QNN bring-up section for the full trail.
      * Flip to Kind.QNN any time; [create] falls back to TFLITE automatically and safely if
      * native init fails, so it's harmless to leave that flip in place if you revisit this. */
-    val KIND: Kind = Kind.TFLITE
+    val KIND: Kind = Kind.QNN
 
     private const val TAG = "SecondSense/engine"
 
@@ -83,9 +83,26 @@ object EngineConfig {
             val binariesPresent = assetExists(context, "models/yolov11_det.bin") &&
                 assetExists(context, "models/depth_anything_v2.bin")
             if (binariesPresent) {
-                Log.i(TAG, "using QNN engine (native init happens in engine.initialize())")
-                val backendSoPath = "${context.applicationInfo.nativeLibraryDir}/libQnnHtp.so"
-                QnnInferenceEngine(context.applicationContext, NativeQnnBackend(backendSoPath))
+                // NativeQnnBackend's <clinit> does System.loadLibrary("secondsense_qnn"), which
+                // only exists in a build made with -PenableQnnNative=true. Without it, catch the
+                // UnsatisfiedLinkError and fall back rather than crashing onCreate.
+                val qnn = try {
+                    val backendSoPath = "${context.applicationInfo.nativeLibraryDir}/libQnnHtp.so"
+                    QnnInferenceEngine(context.applicationContext, NativeQnnBackend(backendSoPath), imuTracker)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "QNN native bridge unavailable (build without -PenableQnnNative?): ${t.message}")
+                    null
+                }
+                if (qnn != null) {
+                    Log.i(TAG, "using QNN engine (native init happens in engine.initialize())")
+                    qnn
+                } else if (assetExists(context, "models/yolov11_det.tflite") &&
+                    assetExists(context, "models/depth_anything_v2.tflite")
+                ) {
+                    TfliteInferenceEngine(context.applicationContext, imuTracker)
+                } else {
+                    MockInferenceEngine()
+                }
             } else {
                 Log.w(TAG, "QNN .bin assets not found; falling back to TFLITE if available, else MOCK")
                 if (assetExists(context, "models/yolov11_det.tflite") &&

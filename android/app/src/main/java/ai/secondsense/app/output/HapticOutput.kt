@@ -176,6 +176,29 @@ class HapticOutput(context: Context) {
         }
     }
 
+    /**
+     * Head-height / OVERHEAD hazard — the Bible's #1 differentiator (§3: "catches what the
+     * cane structurally cannot"). A hard jolt then a soft one — reads as "something's at your
+     * head, pull back" — deliberately unlike dropOff (3 escalating), panic (2 equal sharp),
+     * hazardSound (4 even), arrived (3 gentle). Fired edge-triggered by MainActivity.
+     */
+    fun overhead() {
+        val v = vibrator ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val timings = longArrayOf(0, 90, 40, 55)
+            val amps = intArrayOf(0, 255, 0, 130)
+            val effect = if (hasAmplitudeControl) {
+                VibrationEffect.createWaveform(timings, amps, -1)
+            } else {
+                VibrationEffect.createWaveform(timings, -1)
+            }
+            v.vibrate(effect)
+        } else {
+            @Suppress("DEPRECATION")
+            v.vibrate(longArrayOf(0, 90, 40, 55), -1)
+        }
+    }
+
     private fun vibrate(durationMs: Long, amplitude: Int) {
         val v = vibrator ?: return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

@@ -34,6 +34,7 @@
 #include "HTP/QnnHtpDevice.h"
 #include "HTP/QnnHtpDeviceConfigShared.h"
 #include "System/QnnSystemContext.h"
+#include "System/QnnSystemInterface.h"   // QAIRT 2.49: QnnSystemContext_* is behind this provider iface
 
 #define LOG_TAG "SecondSense/qnn_jni"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -53,6 +54,7 @@ bool g_ready = false;
 // struct so it survives past QnnSystemContext_free — that's the only reason this exists
 // instead of reusing Qnn_Tensor_t directly (its dimensions pointer would dangle).
 struct TensorSpec {
+    uint32_t id = 0;   // backend-assigned tensor ID — graphExecute matches by THIS, not name
     std::string name;
     Qnn_DataType_t dataType = QNN_DATATYPE_FLOAT_32;
     std::vector<uint32_t> dims;
@@ -105,16 +107,18 @@ bool initInterface(const char* backendSoPath) {
     return true;
 }
 
-// libQnnSystem.so's introspection API (QnnSystemContext_*) is a set of PLAIN exported C
-// functions (marked QNN_SYSTEM_API in the header) — no provider-interface indirection needed,
-// unlike the backend .so. Used once per model load to discover the real compiled graph name
+// libQnnSystem.so's introspection API. IMPORTANT (QAIRT 2.49, verified on-device via `nm`):
+// QnnSystemContext_create/getBinaryInfo/free are NOT flat-exported C symbols — libQnnSystem.so
+// only exports `QnnSystemInterface_getProviders`, and the QnnSystemContext_* function pointers
+// come out of that provider's versioned interface struct, exactly like the backend .so's
+// QnnInterface_getProviders. Used once per model load to discover the real compiled graph name
 // and tensor shapes from the context binary itself, since a qai_hub_models export's internal
 // graph name (e.g. "yolo26_det_float_yolo26s") has no relation to our own "yolo"/"depth" keys.
-typedef Qnn_ErrorHandle_t (*QnnSystemContextCreateFn)(QnnSystemContext_Handle_t*);
-typedef Qnn_ErrorHandle_t (*QnnSystemContextGetBinaryInfoFn)(
-    QnnSystemContext_Handle_t, void*, uint64_t,
-    const QnnSystemContext_BinaryInfo_t**, Qnn_ContextBinarySize_t*);
-typedef Qnn_ErrorHandle_t (*QnnSystemContextFreeFn)(QnnSystemContext_Handle_t);
+typedef QnnSystemContext_CreateFn_t          QnnSystemContextCreateFn;
+typedef QnnSystemContext_GetBinaryInfoFn_t   QnnSystemContextGetBinaryInfoFn;
+typedef QnnSystemContext_FreeFn_t            QnnSystemContextFreeFn;
+typedef Qnn_ErrorHandle_t (*QnnSystemInterfaceGetProvidersFn)(
+    const QnnSystemInterface_t*** providerList, uint32_t* numProviders);
 
 void* g_systemLib = nullptr;
 QnnSystemContextCreateFn g_sysCreate = nullptr;
@@ -122,22 +126,36 @@ QnnSystemContextGetBinaryInfoFn g_sysGetBinaryInfo = nullptr;
 QnnSystemContextFreeFn g_sysFree = nullptr;
 
 bool ensureSystemLib() {
-    if (g_systemLib) return true;
-    // Bundled alongside the backend .so in jniLibs/arm64-v8a — see build.gradle.kts's
-    // jniLibs wiring and the copy step documented in secondsense_phase7... (jniLibs README).
-    g_systemLib = dlopen("libQnnSystem.so", RTLD_NOW | RTLD_LOCAL);
+    // Cache on REAL success (all three fn pointers resolved), not merely on the lib being
+    // dlopen'd — the old `if (g_systemLib) return true` made a second call after a failed
+    // symbol resolve return true with null pointers, which then SIGSEGV'd at g_sysCreate().
+    if (g_sysCreate && g_sysGetBinaryInfo && g_sysFree) return true;
     if (!g_systemLib) {
-        LOGE("dlopen(libQnnSystem.so) failed: %s", dlerror());
+        // Bundled alongside the backend .so in jniLibs/arm64-v8a.
+        g_systemLib = dlopen("libQnnSystem.so", RTLD_NOW | RTLD_LOCAL);
+        if (!g_systemLib) {
+            LOGE("dlopen(libQnnSystem.so) failed: %s", dlerror());
+            return false;
+        }
+    }
+    auto getProviders = reinterpret_cast<QnnSystemInterfaceGetProvidersFn>(
+        dlsym(g_systemLib, "QnnSystemInterface_getProviders"));
+    if (!getProviders) {
+        LOGE("QnnSystemInterface_getProviders not found in libQnnSystem.so");
         return false;
     }
-    g_sysCreate = reinterpret_cast<QnnSystemContextCreateFn>(
-        dlsym(g_systemLib, "QnnSystemContext_create"));
-    g_sysGetBinaryInfo = reinterpret_cast<QnnSystemContextGetBinaryInfoFn>(
-        dlsym(g_systemLib, "QnnSystemContext_getBinaryInfo"));
-    g_sysFree = reinterpret_cast<QnnSystemContextFreeFn>(
-        dlsym(g_systemLib, "QnnSystemContext_free"));
+    const QnnSystemInterface_t** providers = nullptr;
+    uint32_t numProviders = 0;
+    if (getProviders(&providers, &numProviders) != QNN_SUCCESS || numProviders == 0 || !providers) {
+        LOGE("QnnSystemInterface_getProviders returned no providers");
+        return false;
+    }
+    const auto& sysIface = providers[0]->QNN_SYSTEM_INTERFACE_VER_NAME;
+    g_sysCreate        = sysIface.systemContextCreate;
+    g_sysGetBinaryInfo = sysIface.systemContextGetBinaryInfo;
+    g_sysFree          = sysIface.systemContextFree;
     if (!g_sysCreate || !g_sysGetBinaryInfo || !g_sysFree) {
-        LOGE("libQnnSystem.so missing expected symbols");
+        LOGE("libQnnSystem provider is missing systemContext* function pointers");
         return false;
     }
     return true;
@@ -161,6 +179,42 @@ const char* nameOf(const Qnn_Tensor_t& t) {
 
 Qnn_DataType_t dataTypeOf(const Qnn_Tensor_t& t) {
     return (t.version == QNN_TENSOR_VERSION_2) ? t.v2.dataType : t.v1.dataType;
+}
+
+uint32_t idOf(const Qnn_Tensor_t& t) {
+    return (t.version == QNN_TENSOR_VERSION_2) ? t.v2.id : t.v1.id;
+}
+
+// Version-aware view of a context binary's graph list. The BinaryInfo union's V1/V2/V3
+// members have DIFFERENT layouts (V3 dropped the hwInfoBlob* fields V1/V2 carry), so
+// numGraphs/graphs live at different offsets — reading a V3 struct as V1 gives garbage
+// pointers and a SIGSEGV. QAIRT 2.49 emits V3 for a qai_hub_models float export.
+struct BinaryGraphs { uint32_t count = 0; const QnnSystemContext_GraphInfo_t* graphs = nullptr; };
+BinaryGraphs graphsOf(const QnnSystemContext_BinaryInfo_t* bi) {
+    switch (bi->version) {
+        case QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_1:
+            return { bi->contextBinaryInfoV1.numGraphs, bi->contextBinaryInfoV1.graphs };
+        case QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_2:
+            return { bi->contextBinaryInfoV2.numGraphs, bi->contextBinaryInfoV2.graphs };
+        case QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_3:
+            return { bi->contextBinaryInfoV3.numGraphs, bi->contextBinaryInfoV3.graphs };
+        default:
+            LOGE("graphsOf: unknown BinaryInfo version 0x%x", (int) bi->version);
+            return {};
+    }
+}
+
+// The first 5 fields (graphName, numGraphInputs, graphInputs, numGraphOutputs, graphOutputs)
+// are an identical common prefix across GraphInfoV1/V2/V3, so graphInfoV1 reads them safely
+// whatever the graph-info version is.
+struct GraphView {
+    const char* name = nullptr;
+    uint32_t numIn = 0;  const Qnn_Tensor_t* in = nullptr;
+    uint32_t numOut = 0; const Qnn_Tensor_t* out = nullptr;
+};
+GraphView graphViewOf(const QnnSystemContext_GraphInfo_t& gi) {
+    const auto& g = gi.graphInfoV1;
+    return { g.graphName, g.numGraphInputs, g.graphInputs, g.numGraphOutputs, g.graphOutputs };
 }
 
 // Byte size of one element for the data types our float-precision exports actually use.
@@ -200,8 +254,13 @@ Java_ai_secondsense_app_inference_qnn_NativeQnnBackend_nativeInit(
     // dir), where the skel .so's were also bundled.
     size_t lastSlash = pathStr.find_last_of('/');
     std::string libDir = (lastSlash != std::string::npos) ? pathStr.substr(0, lastSlash) : ".";
-    setenv("ADSP_LIBRARY_PATH", libDir.c_str(), 1);
-    LOGI("ADSP_LIBRARY_PATH set to %s", libDir.c_str());
+    // Our extracted skel dir FIRST, then the device's own vendor DSP dirs so the FastRPC
+    // loader can also resolve any dependency skels the OEM ships (observed on this iQOO:
+    // /vendor/lib/rfsa/adsp holds a device libQnnHtpV81.so + camera skels).
+    std::string adspPath = libDir +
+        ";/vendor/lib/rfsa/adsp;/vendor/dsp/cdsp;/system/vendor/lib/rfsa/adsp;/dsp";
+    setenv("ADSP_LIBRARY_PATH", adspPath.c_str(), 1);
+    LOGI("ADSP_LIBRARY_PATH set to %s", adspPath.c_str());
 
     bool ok = initInterface(path);
     env->ReleaseStringUTFChars(backendSoPath, path);
@@ -295,39 +354,36 @@ Java_ai_secondsense_app_inference_qnn_NativeQnnBackend_nativeLoadModel(
             g_sysFree(sysCtx);
             return JNI_FALSE;
         }
-        if (binaryInfo->version != QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_1) {
-            // V2/V3 add updatable-tensor / graph-blob fields we don't need for a plain float
-            // export; V1's graphs[]/graphInfoV1 layout is a prefix-compatible subset in
-            // practice for our purposes, but log loudly since this is the one place a newer
-            // QAIRT SDK version could genuinely change behavior.
-            LOGI("Binary info version %d != V1 (expected for a plain float export) — "
-                 "reading via V1 layout anyway, verify if this model behaves unexpectedly",
-                 (int) binaryInfo->version);
-        }
-        const auto& v1 = binaryInfo->contextBinaryInfoV1;
-        if (v1.numGraphs == 0 || !v1.graphs) {
-            LOGE("Context binary for %s has no graphs", modelKey.c_str());
+        LOGI("Binary info version 0x%x for %s", (int) binaryInfo->version, modelKey.c_str());
+        BinaryGraphs bg = graphsOf(binaryInfo);   // version-aware — see graphsOf()
+        if (bg.count == 0 || !bg.graphs) {
+            LOGE("Context binary for %s has no graphs (version 0x%x)",
+                 modelKey.c_str(), (int) binaryInfo->version);
             g_sysFree(sysCtx);
             return JNI_FALSE;
         }
         // qai_hub_models exports compile exactly one graph per context binary — take the first.
-        const auto& g = v1.graphs[0].graphInfoV1;
-        std::string realGraphName = g.graphName ? g.graphName : "";
+        GraphView g = graphViewOf(bg.graphs[0]);
+        std::string realGraphName = g.name ? g.name : "";
         LOGI("Model '%s': real compiled graph name = '%s' (%u inputs, %u outputs)",
-             modelKey.c_str(), realGraphName.c_str(), g.numGraphInputs, g.numGraphOutputs);
+             modelKey.c_str(), realGraphName.c_str(), g.numIn, g.numOut);
 
-        for (uint32_t i = 0; i < g.numGraphInputs; i++) {
+        for (uint32_t i = 0; i < g.numIn; i++) {
             TensorSpec spec;
-            spec.name = nameOf(g.graphInputs[i]);
-            spec.dataType = dataTypeOf(g.graphInputs[i]);
-            spec.dims = dimsOf(g.graphInputs[i]);
+            spec.id = idOf(g.in[i]);
+            spec.name = nameOf(g.in[i]);
+            spec.dataType = dataTypeOf(g.in[i]);
+            spec.dims = dimsOf(g.in[i]);
+            LOGI("  in[%u]  id=%u name='%s'", i, spec.id, spec.name.c_str());
             model.inputs.push_back(spec);
         }
-        for (uint32_t i = 0; i < g.numGraphOutputs; i++) {
+        for (uint32_t i = 0; i < g.numOut; i++) {
             TensorSpec spec;
-            spec.name = nameOf(g.graphOutputs[i]);
-            spec.dataType = dataTypeOf(g.graphOutputs[i]);
-            spec.dims = dimsOf(g.graphOutputs[i]);
+            spec.id = idOf(g.out[i]);
+            spec.name = nameOf(g.out[i]);
+            spec.dataType = dataTypeOf(g.out[i]);
+            spec.dims = dimsOf(g.out[i]);
+            LOGI("  out[%u] id=%u name='%s'", i, spec.id, spec.name.c_str());
             model.outputs.push_back(spec);
         }
         g_sysFree(sysCtx); // frees binaryInfo too — we've already deep-copied what we need.
@@ -388,6 +444,7 @@ Java_ai_secondsense_app_inference_qnn_NativeQnnBackend_nativeRun(
     std::vector<uint32_t> inDims = model.inputs[0].dims; // kept alive for the call below
     Qnn_Tensor_t inTensor = QNN_TENSOR_INIT;
     inTensor.version = QNN_TENSOR_VERSION_1;
+    inTensor.v1.id = model.inputs[0].id;   // graphExecute matches by ID (QnnDsp err 6004 otherwise)
     inTensor.v1.name = model.inputs[0].name.c_str();
     inTensor.v1.dataType = model.inputs[0].dataType;
     inTensor.v1.rank = static_cast<uint32_t>(inDims.size());
@@ -410,6 +467,7 @@ Java_ai_secondsense_app_inference_qnn_NativeQnnBackend_nativeRun(
 
         Qnn_Tensor_t t = QNN_TENSOR_INIT;
         t.version = QNN_TENSOR_VERSION_1;
+        t.v1.id = spec.id;   // graphExecute matches by ID
         t.v1.name = spec.name.c_str();
         t.v1.dataType = spec.dataType;
         t.v1.rank = static_cast<uint32_t>(outDimsStorage[i].size());
@@ -443,17 +501,41 @@ Java_ai_secondsense_app_inference_qnn_NativeQnnBackend_nativeRun(
 
         uint32_t n = spec.elementCount();
         jfloatArray dataArr = env->NewFloatArray(static_cast<jsize>(n));
-        if (spec.dataType == QNN_DATATYPE_FLOAT_32) {
-            env->SetFloatArrayRegion(
-                dataArr, 0, static_cast<jsize>(n),
-                reinterpret_cast<jfloat*>(outBuffers[i].data()));
-        } else {
-            LOGE("nativeRun(%s): output '%s' dataType 0x%x is not FLOAT_32 — "
-                 "returning zeros, real conversion not implemented",
-                 modelKey.c_str(), spec.name.c_str(), spec.dataType);
-            std::vector<jfloat> zeros(n, 0.0f);
-            env->SetFloatArrayRegion(dataArr, 0, static_cast<jsize>(n), zeros.data());
+        // Widen every output to float32 — the Kotlin decode layer speaks only float. This is a
+        // straight numeric widen (NOT a dequantize): a qai_hub_models "float" export still
+        // emits integer INDEX tensors (yolo class_idx is UINT8 0..79), which must arrive as the
+        // integer VALUE cast to float, not reinterpreted bytes.
+        std::vector<jfloat> f(n);
+        const uint8_t* raw = outBuffers[i].data();
+        switch (spec.dataType) {
+            case QNN_DATATYPE_FLOAT_32:
+                std::memcpy(f.data(), raw, static_cast<size_t>(n) * sizeof(float));
+                break;
+            case QNN_DATATYPE_UINT_8:
+                for (uint32_t k = 0; k < n; k++) f[k] = static_cast<jfloat>(raw[k]);
+                break;
+            case QNN_DATATYPE_INT_8:
+                for (uint32_t k = 0; k < n; k++) f[k] = static_cast<jfloat>(reinterpret_cast<const int8_t*>(raw)[k]);
+                break;
+            case QNN_DATATYPE_UINT_16:
+                for (uint32_t k = 0; k < n; k++) f[k] = static_cast<jfloat>(reinterpret_cast<const uint16_t*>(raw)[k]);
+                break;
+            case QNN_DATATYPE_INT_16:
+                for (uint32_t k = 0; k < n; k++) f[k] = static_cast<jfloat>(reinterpret_cast<const int16_t*>(raw)[k]);
+                break;
+            case QNN_DATATYPE_UINT_32:
+                for (uint32_t k = 0; k < n; k++) f[k] = static_cast<jfloat>(reinterpret_cast<const uint32_t*>(raw)[k]);
+                break;
+            case QNN_DATATYPE_INT_32:
+                for (uint32_t k = 0; k < n; k++) f[k] = static_cast<jfloat>(reinterpret_cast<const int32_t*>(raw)[k]);
+                break;
+            default:
+                LOGE("nativeRun(%s): output '%s' unhandled dataType 0x%x — zeros",
+                     modelKey.c_str(), spec.name.c_str(), spec.dataType);
+                for (uint32_t k = 0; k < n; k++) f[k] = 0.0f;
+                break;
         }
+        env->SetFloatArrayRegion(dataArr, 0, static_cast<jsize>(n), f.data());
 
         env->SetObjectArrayElement(result, static_cast<jsize>(i * 2), shapeArr);
         env->SetObjectArrayElement(result, static_cast<jsize>(i * 2 + 1), dataArr);

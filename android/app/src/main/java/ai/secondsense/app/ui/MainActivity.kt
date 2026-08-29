@@ -3,7 +3,10 @@ package ai.secondsense.app.ui
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.speech.tts.TextToSpeech
 import android.util.Size
+import android.view.GestureDetector
+import android.view.MotionEvent
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -16,6 +19,8 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import ai.secondsense.app.audio.HazardSoundDetector
 import ai.secondsense.app.camera.FrameAnalyzer
+import ai.secondsense.app.inference.decode.DetectionStabilizer
+import ai.secondsense.app.voice.SceneNarrator
 import ai.secondsense.app.dashboard.DashboardServer
 import ai.secondsense.app.dashboard.QrCodeGenerator
 import ai.secondsense.app.databinding.ActivityMainBinding
@@ -109,8 +114,18 @@ class MainActivity : AppCompatActivity() {
     // on-device false positive (desk+keyboard scene fired BOTH V2 and V3 independently — see
     // HazardFusion.kt's revision notes). V3's hazardState is now the only drop-off signal.
     @Volatile private var lastHazardState: ai.secondsense.app.inference.decode.HazardState? = null
+
+    // Accuracy: multi-frame detection-confidence stabilization (no model change).
+    private val stabilizer = DetectionStabilizer()
+    // Overhead / head-height hazard channel (Bible §3) — edge-triggered.
+    @Volatile private var lastOverhead = false
+    // Double-tap "what's around me" scene description.
+    @Volatile private var lastResult: FrameResult? = null
+    private var tts: TextToSpeech? = null
+    private var sceneGestures: GestureDetector? = null
     @Volatile private var lastPossibleDropAtMs = 0L
     private val POSSIBLE_DROP_COOLDOWN_MS = 1500L
+    private val OVERHEAD_PROXIMITY = 0.45f
 
     // #30 laptop dashboard — a spectator view for judges/demo-partners, not the user (who
     // never sees the screen). Null if the port failed to bind; everything else degrades
@@ -235,6 +250,19 @@ class MainActivity : AppCompatActivity() {
             sonifying = checked
             if (checked) cueEngine.start() else { cueEngine.stop(); cueEngine.update(null) }
         }
+        // Default ON: the cue loop is what actually renders every audio/haptic cue (obstacle
+        // AND voice steering). Setting it here fires the listener above -> sonifying=true +
+        // cueEngine.start(). Toggle off in-app if you need silence during setup.
+        binding.switchSonify.isChecked = true
+
+        // Double-tap the camera preview -> speak "what's around me" (offline, no LLM).
+        tts = TextToSpeech(this) {}
+        sceneGestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+            override fun onDoubleTap(e: MotionEvent): Boolean { narrateScene(); return true }
+        })
+        // dispatchTouchEvent (below) feeds it every touch on the window, before any view can
+        // consume it — the PreviewView surface + child buttons otherwise eat the events.
 
         // Phase 4 voice search (#26–#28): gated to SCAN_SEEK (#25 — you stop, then ask).
         binding.btnFind.setOnClickListener {
@@ -311,6 +339,7 @@ class MainActivity : AppCompatActivity() {
                 put("hazardListening", lastHazardSampleLabel)
                 put("hazardLast", lastHazardLabel)
                 put("ducked", isDucked)
+                put("overhead", lastOverhead)
                 put("goal", if (vectorToGoal.isActive) vectorToGoal.activeGoal else null)
                 put("detections", JSONArray().apply {
                     result.detections.take(6).forEach { d ->
@@ -371,6 +400,24 @@ class MainActivity : AppCompatActivity() {
      * vector-to-goal target (#28). Transcription is the QNN Whisper model: until the native
      * bridge lands the recognizer isn't ready, and we say so honestly instead of faking a goal.
      */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        sceneGestures?.onTouchEvent(ev)   // observe every touch; don't consume
+        return super.dispatchTouchEvent(ev)
+    }
+
+    /** Double-tap handler: speak a one-sentence description of the current frame (offline). */
+    private fun narrateScene() {
+        val text = SceneNarrator.describe(lastResult)
+        android.util.Log.i("SecondSense/scene", "narrateScene: \"$text\" (tts=${tts != null})")
+        val spoke = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "scene")
+        runOnUiThread {
+            Toast.makeText(this, "🔊 $text", Toast.LENGTH_LONG).show()
+            if (spoke != TextToSpeech.SUCCESS) {
+                Toast.makeText(this, "(no TTS voice — install one in Settings › Text-to-speech)", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
     private fun startVoiceCapture() {
         Toast.makeText(this, "Listening… say \"find the …\"", Toast.LENGTH_SHORT).show()
         // The hazard detector holds a continuous AudioRecord on the MIC; a second AudioRecord
@@ -389,6 +436,7 @@ class MainActivity : AppCompatActivity() {
                     noun == null -> Toast.makeText(this, "Didn't catch a target", Toast.LENGTH_SHORT).show()
                     else -> {
                         vectorToGoal.setGoal(noun)
+                        binding.switchSonify.isChecked = true   // ensure the cue loop is running to steer
                         Toast.makeText(this, "Goal set: $noun", Toast.LENGTH_SHORT).show()
                     }
                 }
@@ -436,9 +484,25 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun onFrameResult(result: FrameResult) {
+    private fun onFrameResult(raw: FrameResult) {
         frameCount++
-        lastInferenceMs = result.inferenceMillis
+        lastInferenceMs = raw.inferenceMillis
+
+        // ACCURACY: multi-frame confidence stabilization — boost consistently re-seen
+        // detections, hold down one-frame flickers. Engine-agnostic post-processing.
+        val result = raw.copy(detections = stabilizer.update(raw.detections))
+        lastResult = result
+
+        // OVERHEAD / head-height hazard (Bible §3, the #1 differentiator): a close object whose
+        // WHOLE box sits high in the frame is exactly the cane's blind spot. Distinct cue, on
+        // the rising edge only, independent of the sonification toggle.
+        // Box CENTER in the upper 40% of the frame (a real head-height hazard spans the
+        // upper-middle; requiring the whole box up top was too strict to ever fire).
+        val overhead = result.detections.any {
+            it.box.centerY < 0.40f && it.proximity >= OVERHEAD_PROXIMITY
+        }
+        if (overhead && !lastOverhead) haptics.overhead()
+        lastOverhead = overhead
 
         // #17 DROP-OFF: a downward negative obstacle is life-safety-critical, so it fires its
         // own distinct haptic REGARDLESS of the sonification toggle — but only on the rising
@@ -523,6 +587,7 @@ class MainActivity : AppCompatActivity() {
                 append("frames: $frameCount   infer: ${lastInferenceMs}ms\n")
                 append("dets: ${result.detections.size}   crop: ${analyzer.centerCrop}   son: $sonifying\n")
                 append("cal: ${if (calibration.isCalibrated) "on@%.2f".format(calibration.baselineValue ?: 0f) else "off"}\n")
+                if (overhead) append("⚠ OVERHEAD / HEAD-HEIGHT HAZARD\n")
                 append("baro: ${if (!barometer.isAvailable) "no sensor on this device" else "trend=%.3f hPa".format(barometer.pressureTrendHpa() ?: 0f)}\n")
                 if (hazardDetector.isReady) {
                     append("hazard listen: ${lastHazardSampleLabel ?: "—"} (%.2f)\n".format(lastHazardSampleScore))
@@ -536,7 +601,7 @@ class MainActivity : AppCompatActivity() {
                     append("detects: (none)\n")
                 } else {
                     topDets.forEachIndexed { i, d ->
-                        append("det${i+1}: ${d.label ?: "(unknown)"} s=${"%.2f".format(d.score)} prox=${"%.2f".format(d.proximity)}\n")
+                        append("det${i+1}: ${d.label ?: "(unknown)"} s=${"%.2f".format(d.score)} prox=${"%.2f".format(d.proximity)} cy=${"%.2f".format(d.box.centerY)}\n")
                     }
                 }
                 val rawSide = rawTarget?.let {
@@ -590,6 +655,7 @@ class MainActivity : AppCompatActivity() {
         EngineConfig.imuTracker?.stop()
         barometer.stop()
         hazardDetector.stop()
+        stabilizer.reset()   // camera pauses -> tracks would go stale
     }
 
     override fun onResume() {
@@ -622,5 +688,6 @@ class MainActivity : AppCompatActivity() {
         dashboardServer?.stop()
         barometer.stop()
         hazardDetector.close()
+        tts?.run { stop(); shutdown() }
     }
 }
