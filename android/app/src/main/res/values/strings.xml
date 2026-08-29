@@ -9,9 +9,15 @@
     <string name="speak_hindi">Speak in Hindi (हिंदी में सुनें)</string>
     <string name="translate_signs">Translate signs to my language</string>
     <string name="room_scan">Room scan (AR, experimental)</string>
+    <string name="admin_close">Close admin panel</string>
+    <string name="status_walking">WALKING</string>
+    <string name="status_sub_default">starting up…</string>
+    <string name="gesture_hint">Tap top: what\'s around · Tap middle: status · Tap bottom: find\nDouble-tap: cues on/off · Two-finger tap: pause · Swipe up/down: mode\nLong-press: menu · Three-finger tap: help · Volume up: repeat · Volume down: loudness</string>
+    <string name="tb_around">What\'s around me</string>
+    <string name="tb_status">Repeat and status</string>
+    <string name="tb_find">Find something</string>
     <string name="calibrate">Calibrate (1-tap baseline) (#7)</string>
     <string name="find_voice">Find… (voice) (#26)</string>
     <string name="debug_panel">Debug Panel — test one thing at a time</string>
-    <string name="dashboard_qr_desc">QR code to open the live dashboard on a laptop</string>
     <string name="hud_booting">booting…</string>
 </resources>

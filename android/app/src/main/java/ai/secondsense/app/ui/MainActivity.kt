@@ -1,12 +1,17 @@
 package ai.secondsense.app.ui
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.util.Size
 import android.view.GestureDetector
+import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.View
+import android.view.accessibility.AccessibilityManager
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -34,7 +39,6 @@ import ai.secondsense.app.sonification.ObstacleHabituation
 import java.util.Locale
 import ai.secondsense.app.voice.SceneNarrator
 import ai.secondsense.app.dashboard.DashboardServer
-import ai.secondsense.app.dashboard.QrCodeGenerator
 import ai.secondsense.app.databinding.ActivityMainBinding
 import ai.secondsense.app.sensors.BarometerMonitor
 import org.json.JSONArray
@@ -143,6 +147,25 @@ class MainActivity : AppCompatActivity() {
     private var tts: TextToSpeech? = null
     @Volatile private var ttsReady = false
     private var sceneGestures: GestureDetector? = null
+
+    // --- Blind-first interaction layer ---
+    private val audioManager by lazy { getSystemService(Context.AUDIO_SERVICE) as AudioManager }
+    private val uiPrefs by lazy { getSharedPreferences("secondsense_ui", Context.MODE_PRIVATE) }
+    @Volatile private var talkbackOn = false
+    @Volatile private var paused = false
+    private var lastAnnouncement: String? = null
+    private var lastBigStatusMs = 0L
+    // multi-finger tap tracking (GestureDetector only reports single-pointer gestures)
+    private var gStartMs = 0L
+    private var gStartX = 0f
+    private var gStartY = 0f
+    private var gMaxPointers = 1
+    private var gMoved = false
+    // spoken settings menu
+    private var menuOpen = false
+    private var menuIndex = 0
+    private var cueVolLevel = 2   // 0 low, 1 med, 2 high
+    private var voiceSpeedLevel = 1 // 0 slow, 1 normal, 2 fast
 
     // Spoken-language preference (English / Hindi) + on-device Hindi<->English translation.
     private val langPrefs by lazy { LanguagePrefs(this) }
@@ -398,12 +421,66 @@ class MainActivity : AppCompatActivity() {
         thermalGovernor.onNotice = { msg ->
             speakLocalized(msg, langPrefs.speakHindi, TextToSpeech.QUEUE_ADD, "thermal")
         }
+        // --- Blind-first gesture surface. dispatchTouchEvent (below) feeds this every touch
+        // before any child view can eat it. Suppressed entirely when TalkBack is on (it drives
+        // the visible fallback buttons instead) and while the spoken menu owns input. ---
         sceneGestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            private fun surfaceInactive() =
+                talkbackOn || binding.adminPanel.visibility == View.VISIBLE
+
             override fun onDown(e: MotionEvent): Boolean = true
-            override fun onDoubleTap(e: MotionEvent): Boolean { narrateScene(); return true }
+
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                if (surfaceInactive() || gMaxPointers >= 2) return false
+                if (menuOpen) return true
+                when ((e.y / rootH()).coerceIn(0f, 0.999f)) {
+                    in 0f..0.34f -> narrateScene()
+                    in 0.34f..0.67f -> announceStatus()
+                    else -> enterExploreAndListen()
+                }
+                return true
+            }
+
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                if (surfaceInactive() || gMaxPointers >= 2) return false
+                if (menuOpen) { menuActivate(); return true }
+                toggleSonify()
+                return true
+            }
+
+            override fun onLongPress(e: MotionEvent) {
+                if (talkbackOn || menuOpen) return
+                if (binding.adminPanel.visibility == View.VISIBLE) return
+                if (e.x > rootW() * 0.66f && e.y > rootH() * 0.66f) toggleAdmin() else openSpokenMenu()
+            }
+
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                if (surfaceInactive()) return false
+                if (kotlin.math.abs(vy) < kotlin.math.abs(vx) || kotlin.math.abs(vy) < 900f) return false
+                if (menuOpen) { if (vy < 0) menuMove(-1) else menuMove(1) } else toggleWalkExplore()
+                return true
+            }
         })
-        // dispatchTouchEvent (below) feeds it every touch on the window, before any view can
-        // consume it — the PreviewView surface + child buttons otherwise eat the events.
+
+        // TalkBack / explore-by-touch: switch to visible focusable buttons, don't fight it.
+        talkbackOn = (getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager)
+            ?.isTouchExplorationEnabled == true
+        binding.tbButtons.visibility = if (talkbackOn) View.VISIBLE else View.GONE
+        binding.talkbackHint.visibility = if (talkbackOn) View.GONE else View.VISIBLE
+        binding.btnTbAround.setOnClickListener { narrateScene() }
+        binding.btnTbStatus.setOnClickListener { announceStatus() }
+        binding.btnTbFind.setOnClickListener { enterExploreAndListen() }
+        binding.btnCloseAdmin.setOnClickListener { toggleAdmin() }
+
+        updateBigStatus()
+        // First-run: read the gesture help aloud once TTS is up (retry via 3-finger tap / menu).
+        if (!uiPrefs.getBoolean("onboarded", false)) {
+            uiPrefs.edit().putBoolean("onboarded", true).apply()
+            binding.blindSurface.postDelayed({
+                announce("Welcome to SecondSense.")
+                binding.blindSurface.postDelayed({ speakHelp() }, 1600)
+            }, 1200)
+        }
 
         // Phase 4 voice search (#26–#28): gated to SCAN_SEEK (#25 — you stop, then ask).
         binding.btnFind.setOnClickListener {
@@ -438,25 +515,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * #30 — start the embedded HTTP server and, if a local IP is available, show a QR code
-     * for a laptop on the same Wi-Fi/hotspot to scan. Never crashes the app if the port is
-     * busy or no network interface is up (e.g. true airplane mode with Wi-Fi also off) —
-     * the assistive pipeline doesn't depend on this succeeding.
+     * #30 — start the embedded telemetry HTTP server (state.json etc. on port 8085 over the
+     * local network). Never crashes the app if the port is busy or no network is up — the
+     * assistive pipeline doesn't depend on it. (The on-screen QR/URL were removed; connect a
+     * laptop by typing the phone's LAN IP, logged below.)
      */
     private fun startDashboardServer() {
         try {
-            val server = DashboardServer().also { it.start() }
-            dashboardServer = server
-            val ip = DashboardServer.localIpAddress(this)
-            if (ip != null) {
-                val url = "http://$ip:8085/"
-                binding.dashboardQr.setImageBitmap(QrCodeGenerator.generate(url))
-                binding.dashboardUrl.text = url
-                binding.dashboardQr.visibility = android.view.View.VISIBLE
-                binding.dashboardUrl.visibility = android.view.View.VISIBLE
+            dashboardServer = DashboardServer().also { it.start() }
+            DashboardServer.localIpAddress(this)?.let {
+                android.util.Log.i("SecondSense/dashboard", "telemetry at http://$it:8085/")
             }
         } catch (t: Throwable) {
-            // Port busy, no network, etc. — dashboard is a spectator aid, never block the app.
             android.util.Log.w("SecondSense/dashboard", "server start failed: ${t.message}")
         }
     }
@@ -557,8 +627,205 @@ class MainActivity : AppCompatActivity() {
      * bridge lands the recognizer isn't ready, and we say so honestly instead of faking a goal.
      */
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (!talkbackOn && binding.adminPanel.visibility != View.VISIBLE) trackMultiFingerTap(ev)
         sceneGestures?.onTouchEvent(ev)   // observe every touch; don't consume
         return super.dispatchTouchEvent(ev)
+    }
+
+    /** GestureDetector ignores multi-pointer gestures — detect quick 2- and 3-finger taps here. */
+    private fun trackMultiFingerTap(ev: MotionEvent) {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                gStartMs = System.currentTimeMillis(); gStartX = ev.x; gStartY = ev.y
+                gMaxPointers = 1; gMoved = false
+            }
+            MotionEvent.ACTION_POINTER_DOWN ->
+                gMaxPointers = maxOf(gMaxPointers, ev.pointerCount)
+            MotionEvent.ACTION_MOVE ->
+                if (kotlin.math.hypot((ev.x - gStartX).toDouble(), (ev.y - gStartY).toDouble()) > 60) gMoved = true
+            MotionEvent.ACTION_UP -> {
+                val quick = System.currentTimeMillis() - gStartMs < 320 && !gMoved
+                if (quick && gMaxPointers >= 3) speakHelp()
+                else if (quick && gMaxPointers == 2) { if (menuOpen) closeSpokenMenu() else togglePause() }
+            }
+        }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean = when (keyCode) {
+        KeyEvent.KEYCODE_VOLUME_UP -> { repeatLast(); true }
+        KeyEvent.KEYCODE_VOLUME_DOWN -> { cycleCueVolume(); true }
+        else -> super.onKeyDown(keyCode, event)
+    }
+
+    // --- blind-first handlers -----------------------------------------------------------
+
+    private fun rootW() = binding.blindSurface.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+    private fun rootH() = binding.blindSurface.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+
+    /** Speak + remember, so Volume-Up can repeat it. */
+    private fun announce(text: String) {
+        lastAnnouncement = text
+        speakLocalized(text, langPrefs.speakHindi, TextToSpeech.QUEUE_FLUSH, "announce")
+    }
+
+    private fun repeatLast() = announce(lastAnnouncement ?: "Nothing to repeat.")
+
+    private fun toggleSonify() {
+        binding.switchSonify.isChecked = !binding.switchSonify.isChecked   // fires existing listener
+        haptics.testBuzz()
+        announce(if (binding.switchSonify.isChecked) "Cues on." else "Cues off.")
+        updateBigStatus()
+    }
+
+    private fun togglePause() {
+        paused = !paused
+        if (paused) { cueEngine.stop(); cueEngine.update(null); announce("Paused.") }
+        else { if (sonifying) cueEngine.start(); announce("Resumed.") }
+        updateBigStatus()
+    }
+
+    private fun toggleWalkExplore() {
+        val toExplore = !modeController.acceptsVoiceCommands
+        binding.switchMode.isChecked = toExplore   // fires existing listener -> modeController.set
+        announce(if (toExplore) "Explore mode. Stopped." else "Walk mode.")
+        updateBigStatus()
+    }
+
+    private fun enterExploreAndListen() {
+        if (!modeController.acceptsVoiceCommands) binding.switchMode.isChecked = true
+        announce("Listening. Say what you are looking for.")
+        if (hasMicPermission()) startVoiceCapture() else requestMic.launch(Manifest.permission.RECORD_AUDIO)
+    }
+
+    private fun toggleAdmin() {
+        val show = binding.adminPanel.visibility != View.VISIBLE
+        binding.adminPanel.visibility = if (show) View.VISIBLE else View.GONE
+        announce(if (show) "Admin panel open." else "Admin panel closed.")
+    }
+
+    private fun announceStatus() {
+        val mode = if (paused) "paused" else if (modeController.acceptsVoiceCommands) "explore" else "walking"
+        val cues = if (sonifying && !paused) "cues on" else "cues off"
+        val cam = camHealthShort()
+        val batt = batteryPercent()
+        val seen = lastResult?.detections?.mapNotNull { it.label }?.distinct()?.take(3)
+            ?.joinToString(", ")?.ifEmpty { null }
+        val goal = vectorToGoal.activeGoal
+        announce(buildString {
+            append("$mode, $cues, $cam, battery $batt percent. ")
+            if (goal != null) append("Looking for $goal. ")
+            append(if (seen != null) "I can see $seen." else "Nothing named ahead.")
+        })
+    }
+
+    private var battPctCache = -1
+    private var battPctAtMs = 0L
+    private fun batteryPercent(): Int {
+        val now = System.currentTimeMillis()
+        if (now - battPctAtMs < 15_000L && battPctCache >= 0) return battPctCache
+        val i = registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+        val lvl = i?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = i?.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100) ?: 100
+        battPctCache = if (lvl < 0) -1 else (lvl * 100 / scale)
+        battPctAtMs = now
+        return battPctCache
+    }
+
+    private fun camHealthShort(): String = when (lastCamHealth) {
+        ai.secondsense.app.inference.CameraHealth.OK -> "camera ok"
+        ai.secondsense.app.inference.CameraHealth.DIM -> "camera dim"
+        ai.secondsense.app.inference.CameraHealth.BLOCKED -> "camera blocked"
+        ai.secondsense.app.inference.CameraHealth.MISALIGNED -> "camera angle"
+    }
+
+    private fun cycleCueVolume() {
+        cueVolLevel = (cueVolLevel + 1) % 3
+        val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val target = when (cueVolLevel) { 0 -> max * 35 / 100; 1 -> max * 70 / 100; else -> max }
+        runCatching { audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target.coerceAtLeast(1), 0) }
+        announce("Loudness ${arrayOf("low", "medium", "high")[cueVolLevel]}.")
+    }
+
+    private fun cycleVoiceSpeed() {
+        voiceSpeedLevel = (voiceSpeedLevel + 1) % 3
+        tts?.setSpeechRate(arrayOf(0.8f, 1.0f, 1.35f)[voiceSpeedLevel])
+        announce("Voice speed ${arrayOf("slow", "normal", "fast")[voiceSpeedLevel]}.")
+    }
+
+    private fun speakHelp() {
+        announce(
+            "Gestures. Tap the top of the screen for what is around you. Tap the middle for status. " +
+                "Tap the bottom to find something. Double tap for cues on or off. " +
+                "Two finger tap to pause or resume. Swipe up or down to switch walk and explore. " +
+                "Long press for the settings menu. Volume up repeats the last message. " +
+                "Volume down changes loudness.",
+        )
+    }
+
+    private fun updateBigStatus() {
+        val now = System.currentTimeMillis()
+        if (now - lastBigStatusMs < 400 && !menuOpen) return
+        lastBigStatusMs = now
+        val goal = vectorToGoal.activeGoal
+        val big = when {
+            menuOpen -> "MENU"
+            paused -> "PAUSED"
+            goal != null -> "FINDING\n${goal.uppercase()}"
+            modeController.acceptsVoiceCommands -> "EXPLORE"
+            else -> "WALKING"
+        }
+        val cueStr = if (sonifying && !paused) "cues on" else "cues off"
+        val sub = "$cueStr · ${camHealthShort()} · batt ${batteryPercent()}%"
+        runOnUiThread {
+            binding.statusBig.text = big
+            binding.statusSub.text = sub
+        }
+    }
+
+    // --- spoken settings menu ----------------------------------------------------------
+
+    private data class MenuItem(val title: String, val value: () -> String, val activate: () -> Unit)
+
+    private val menuItems: List<MenuItem> by lazy {
+        listOf(
+            MenuItem("Language", { if (langPrefs.speakHindi) "Hindi" else "English" }) {
+                binding.switchHindi.isChecked = !binding.switchHindi.isChecked
+            },
+            MenuItem("Loudness", { arrayOf("low", "medium", "high")[cueVolLevel] }) { cycleCueVolume() },
+            MenuItem("Voice speed", { arrayOf("slow", "normal", "fast")[voiceSpeedLevel] }) { cycleVoiceSpeed() },
+            MenuItem("Cues", { if (sonifying) "on" else "off" }) { toggleSonify() },
+            MenuItem("Calibrate camera now", { "" }) { binding.btnCalibrate.performClick() },
+            MenuItem("Read help", { "" }) { speakHelp() },
+            MenuItem("Admin panel", { "" }) { toggleAdmin() },
+        )
+    }
+
+    private fun openSpokenMenu() {
+        menuOpen = true
+        menuIndex = 0
+        updateBigStatus()
+        val it = menuItems[0]
+        announce("Settings menu. ${it.title}, ${it.value()}. Swipe up or down to move, double tap to change, two finger tap to close.")
+    }
+
+    private fun closeSpokenMenu() {
+        menuOpen = false
+        updateBigStatus()
+        announce("Menu closed.")
+    }
+
+    private fun menuMove(delta: Int) {
+        menuIndex = (menuIndex + delta + menuItems.size) % menuItems.size
+        val it = menuItems[menuIndex]
+        val v = it.value()
+        announce(if (v.isEmpty()) it.title else "${it.title}, $v")
+    }
+
+    private fun menuActivate() {
+        menuItems[menuIndex].activate()
+        val it = menuItems[menuIndex]
+        val v = it.value()
+        if (v.isNotEmpty()) announce("${it.title} now $v")
     }
 
     /**
@@ -609,9 +876,10 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /** Double-tap handler: speak a one-sentence description of the current frame (offline). */
+    /** "What's around me": speak a one-sentence description of the current frame (offline). */
     private fun narrateScene() {
         val text = SceneNarrator.describe(lastResult)
+        lastAnnouncement = text   // so Volume-Up can repeat it
         android.util.Log.i("SecondSense/scene", "narrateScene: \"$text\" (tts=${tts != null})")
         if (langPrefs.speakHindi && langPrefs.translateSigns) {
             // SceneNarrator emits English — route it through en->hi so it's spoken in Hindi
@@ -867,8 +1135,9 @@ class MainActivity : AppCompatActivity() {
         // its own "path blocked" haptic).
         val camUsable = result.cameraHealth == CameraHealth.OK || result.cameraHealth == CameraHealth.DIM
         val target = if (!camUsable) null else goalCue ?: memoryCue ?: gatedObstacle
-        if (sonifying) cueEngine.update(target)
+        if (sonifying && !paused) cueEngine.update(target)
         publishDashboardState(result, target)
+        updateBigStatus()
 
         runOnUiThread {
             // #23: tier is visible per-cue — colored badge + text. (Full dashboard is #30.)

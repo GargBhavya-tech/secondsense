@@ -7,4 +7,8 @@
     <color name="ss_accent">#4FD1C5</color>
     <color name="ss_primary">#2DD4BF</color>
     <color name="ss_on_primary">#04211D</color>
+    <!-- Blind-first surface: heavy scrim over the camera so the huge status text always reads. -->
+    <color name="ss_blind_scrim">#E6000000</color>
+    <color name="ss_blind_text">#FFFFFFFF</color>
+    <color name="ss_blind_sub">#FFB9C2CC</color>
 </resources>
