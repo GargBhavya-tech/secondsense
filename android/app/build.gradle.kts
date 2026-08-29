@@ -160,6 +160,12 @@ dependencies {
     // as a QR bitmap so a laptop can join by camera-scan instead of typing an IP.
     implementation("com.google.zxing:core:3.5.3")
 
+    // ---- ML Kit — bundled, fully OFFLINE (models ship in the APK, no Play Services fetch) --
+    // Text recognition -> read signs / room numbers / bus numbers (Latin script).
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+    // Face detection -> "person facing you" via head Euler-Y angle. Contour/classification off.
+    implementation("com.google.mlkit:face-detection:16.1.7")
+
     // Unit tests for the pure-logic layer (targeting, channel math)
     testImplementation("junit:junit:4.13.2")
 }

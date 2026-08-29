@@ -19,6 +19,11 @@ import ai.secondsense.app.inference.InferenceEngine
  */
 class FrameAnalyzer(
     private val engine: InferenceEngine,
+    /** Optional secondary consumer of the same upright frame (ML Kit OCR / face). Must be
+     *  cheap + non-blocking — it runs inline on the analysis thread before the frame is freed.
+     *  Kept BEFORE onResult so a trailing-lambda call `FrameAnalyzer(engine) { r -> ... }`
+     *  still binds to onResult. */
+    private val frameSink: ((Bitmap) -> Unit)? = null,
     private val onResult: (FrameResult) -> Unit,
 ) : ImageAnalysis.Analyzer {
 
@@ -31,6 +36,7 @@ class FrameAnalyzer(
             if (bitmap != null) {
                 val result = engine.infer(bitmap, centerCrop)
                 onResult(result)
+                runCatching { frameSink?.invoke(bitmap) }
             }
         } finally {
             // MUST close or the pipeline stalls — CameraX reuses the buffer.

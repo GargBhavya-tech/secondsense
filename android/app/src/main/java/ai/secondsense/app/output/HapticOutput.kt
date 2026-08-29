@@ -199,6 +199,28 @@ class HapticOutput(context: Context) {
         }
     }
 
+    /**
+     * "Path blocked / can't tell" — the V3 hazard states SCENE_NOT_TRAVERSABLE and
+     * SENSOR_BLOCKED previously produced silence (a real gap). A long, low, steady buzz —
+     * clearly "stop, something's wrong", distinct from every transient-pattern cue above.
+     */
+    fun pathBlocked() {
+        val v = vibrator ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val timings = longArrayOf(0, 400)
+            val amps = intArrayOf(0, 110)
+            val effect = if (hasAmplitudeControl) {
+                VibrationEffect.createWaveform(timings, amps, -1)
+            } else {
+                VibrationEffect.createWaveform(timings, -1)
+            }
+            v.vibrate(effect)
+        } else {
+            @Suppress("DEPRECATION")
+            v.vibrate(400L)
+        }
+    }
+
     private fun vibrate(durationMs: Long, amplitude: Int) {
         val v = vibrator ?: return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

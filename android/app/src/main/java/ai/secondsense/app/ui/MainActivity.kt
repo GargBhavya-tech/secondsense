@@ -20,6 +20,7 @@ import androidx.core.content.ContextCompat
 import ai.secondsense.app.audio.HazardSoundDetector
 import ai.secondsense.app.camera.FrameAnalyzer
 import ai.secondsense.app.inference.decode.DetectionStabilizer
+import ai.secondsense.app.perception.MlKitPerception
 import ai.secondsense.app.voice.SceneNarrator
 import ai.secondsense.app.dashboard.DashboardServer
 import ai.secondsense.app.dashboard.QrCodeGenerator
@@ -123,6 +124,18 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var lastResult: FrameResult? = null
     private var tts: TextToSpeech? = null
     private var sceneGestures: GestureDetector? = null
+
+    // ML Kit (offline): OCR sign-reading + "person facing you". Fed the same camera frame.
+    private val perception by lazy {
+        MlKitPerception(
+            onSign = { text -> runOnUiThread { speakAux("Sign: $text") } },
+            onFacingPerson = { runOnUiThread { speakAux("Person facing you"); haptics.testBuzz() } },
+        )
+    }
+    private fun speakAux(text: String) {
+        tts?.speak(text, TextToSpeech.QUEUE_ADD, null, "aux")
+        Toast.makeText(this, "🔊 $text", Toast.LENGTH_SHORT).show()
+    }
     @Volatile private var lastPossibleDropAtMs = 0L
     private val POSSIBLE_DROP_COOLDOWN_MS = 1500L
     private val OVERHEAD_PROXIMITY = 0.45f
@@ -206,7 +219,11 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        analyzer = FrameAnalyzer(engine) { result -> onFrameResult(result) }
+        analyzer = FrameAnalyzer(
+            engine,
+            onResult = { result -> onFrameResult(result) },
+            frameSink = { bmp -> perception.offer(bmp) },
+        )
 
         // --- #6 done-condition: test tone + test buzz on tap ---
         binding.btnTestTone.setOnClickListener { audio.testTone() }
@@ -536,6 +553,13 @@ class MainActivity : AppCompatActivity() {
                 haptics.possibleDrop()
                 lastPossibleDropAtMs = now
             }
+        } else if (
+            (hazardState == ai.secondsense.app.inference.decode.HazardState.SCENE_NOT_TRAVERSABLE ||
+                hazardState == ai.secondsense.app.inference.decode.HazardState.SENSOR_BLOCKED) &&
+            lastHazardState != hazardState
+        ) {
+            // Gap fix: "path blocked / can't tell" — was silent before. Rising edge only.
+            haptics.pathBlocked()
         }
         lastHazardState = hazardState
 
@@ -689,5 +713,6 @@ class MainActivity : AppCompatActivity() {
         barometer.stop()
         hazardDetector.close()
         tts?.run { stop(); shutdown() }
+        runCatching { perception.close() }
     }
 }
