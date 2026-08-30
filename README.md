@@ -1,16 +1,133 @@
+<div align="center">
+
 # SecondSense
 
+**A second pair of eyes for blind and low-vision travellers — running entirely on a
+chest-mounted Android phone, fully offline, at zero recurring cost.**
 
-**On-device spatial-audio + haptic navigation for blind and low-vision users.**
-Fully offline, runs on a chest-mounted Android phone, zero recurring cost.
-Built for the iQOO Hackathon 2026 (Bengaluru City Battle, Aug 29–30).
+![platform](https://img.shields.io/badge/platform-Android%2011%2B-3ddc84)
+![network](https://img.shields.io/badge/network-100%25%20offline-blue)
+![ai](https://img.shields.io/badge/AI-on--device%20(NPU%20%7C%20CPU)-orange)
+![tests](https://img.shields.io/badge/unit%20tests-~118%20passing-brightgreen)
+![event](https://img.shields.io/badge/for-iQOO%20Hackathon%202026-black)
 
-SecondSense is a **cane *complement*, not a replacement** — it catches what a white cane
-structurally cannot: head-height hazards, drop-offs / descending stairs, semantic identity
-("what is it", not just "something is there"), and open-vocabulary goal-seeking ("find the
-chair"). The defensible IP is the **sonification** — turning proximity, identity, and
-direction into something a blind person can act on instantly — not the vision models, which
-are a commodity.
+*It watches the world, decides what matters, and tells you through spatial sound and graded
+vibration — never the screen. And you can just talk to it.*
+
+</div>
+
+---
+
+## Why it exists
+
+A white cane is perfect at one thing: what's touching the ground in the arc in front of your
+feet. It tells you nothing about a person crossing your path, a **step going down** before your
+foot reaches the edge, a branch at head height, which door is the exit, what a sign says, or
+where you set your phone down five minutes ago.
+
+SecondSense is a **cane complement, not a replacement.** It fills exactly those gaps — and it
+is built around one hard rule: **the AI is never the last word on safety.** Ask it "is it safe
+to cross?" and it will *never* say "yes" — that question is physically fenced off from every
+language model in the system (see [The Safety Gate](#the-safety-gate)).
+
+The defensible idea here is not the vision models (those are commodity) — it's the
+**sonification**: turning direction, distance, and identity into something a blind person can
+act on in under a second, and the layered, honest way hazards are confirmed before anything
+makes a sound.
+
+---
+
+## What it does
+
+| Capability | In one line |
+|---|---|
+| **Obstacle awareness** | Names what's ahead ("person, chair, wall"), how far, which direction, and whether it's *approaching* — as continuous spatial sound. |
+| **Drop-off detection** | Detects a step *down* / descending stairs before your foot reaches the edge, using **five independent checks** that must agree. |
+| **The Specular Trap** | Puddles, hard shadows, and shiny marble look exactly like a cliff — three physics vetoes (colour, motion, air-pressure) cancel the false alarm. |
+| **Overhead hazards** | Branches, open cabinet doors, poles at head height — the white cane's blind spot. |
+| **Talk to it** | "What's ahead?", "find a chair", "read that sign", "where did I leave my phone?", "call mum", "I'm on the bus". |
+| **Knows what you're doing** | Six activity modes (walking / standing / home / sitting / transit / conversation) — auto-detected, each reconfiguring the whole app. On a bus, hazard detection turns *off* (a moving vehicle creates phantom drop-offs). |
+| **On-device reasoning** | A 1-billion-parameter language model (Gemma) runs on the phone for anything the command grammar can't handle — grounded in what the camera sees. |
+| **Reads signs, Hindi & English** | Offline OCR in Latin + Devanagari, with on-device translation either way. |
+| **Stays fast when it overheats** | A phone strapped to a warm body throttles in ~15 min — a thermal governor sheds non-critical work first and keeps the safety loop alive. |
+| **Emergency** | Hold both volume keys 2 s → panic tone + spoken battery/status → "say who to call". |
+| **Laptop 3-D demo** | For spectators: the phone streams frames, a laptop builds a live coloured point-cloud of the room. |
+
+---
+
+## How it works
+
+```
+   Camera frame  (~5–15 fps, throttled by heat + context)
+        │
+        ▼
+   PERCEPTION ── object detector (YOLO) → boxes + labels
+              └─ depth model            → per-pixel near/far
+        │
+        ▼
+   FUSION      per-object: direction · proximity · rate-of-approach · moving?
+               + 3-frame stabilisation + WHITE/BLUE/RED confidence tier
+        │
+        ▼
+   HAZARDS     drop-off state machine (5 evidences, 2-of-3 → possible, 3-of-5 → confirmed)
+               ├─ Specular-Trap vetoes  (shadow colour · coplanar motion · barometer)
+               ├─ overhead / head-height
+               └─ camera-health (blocked / dim / knocked off angle)
+        │
+        ▼
+   TARGET      of everything in view, the ONE thing to cue now
+               (hazard > voice goal > memory bearing > nearest obstacle), habituation-gated
+        │
+        ▼
+   OUTPUT      Sonification: pan = direction · pulse-rate = distance · timbre = identity
+               Haptics:      a distinct graded buzz per hazard class  (never mutable for drops)
+               Earcons:      a short tune on every context switch
+               Speech:       answers · sign read-outs · the honest "I can't tell"
+
+   Alongside, continuously:
+     motion sensors → footsteps + vehicle-vibration → activity context (6 modes)
+     barometer      → am I descending?  (independent drop-off check)
+     microphone     → siren/horn detection · voice commands · conversation ducking
+     thermal governor → shed work as the SoC heats, keep a safety floor
+     voice assistant  → wake (one tap) → intent grammar → Gemma for the long tail
+     safety gate      → intercept "is it safe?" before ANY model sees it
+```
+
+### The one rule the cue engine protects — three channels, no bleed
+
+| Dimension | Channel | Never |
+|---|---|---|
+| Direction | equal-power stereo **pan** | — |
+| Distance / urgency | **pulse repetition rate** (faster = closer) | never pitch |
+| Identity | **timbre** — a synthesised auditory icon, or a sped-up spoken word | never rate |
+| Proximity (parallel) | **graded haptics** — a *primary* channel | — |
+| Confidence | grainy **texture** (BLUE/RED) — sounds unsure, never silent | never fakes crispness |
+
+### The Safety Gate
+
+> A blind person asking a gadget "can I walk?" is the highest-stakes moment in the product.
+> A small language model, trained to be agreeable, will say **"yes, go ahead"** over a live
+> drop-off warning. So it is never allowed to answer.
+
+Six layers, in order:
+
+1. A **learned n-gram classifier** (37 KB, no download, works in English / Hindi / Kannada
+   because it reads character patterns not words) catches the question — tuned for recall.
+2. A short obvious-phrasing fast path.
+3. The answer is a **fixed, legally-careful template** filled from the *real* sensor state —
+   *"I cannot decide whether it is safe to move. The sensors show \[state], but you must rely
+   on your white cane, traffic sounds, and your own judgement."* Never the word "safe" as a
+   yes.
+4. A **1.5-second hazard memory** so a drop-off that flickered during the question still counts.
+5. If anything reaches the LLM anyway, its reply is scanned — a "you can go" green-light is
+   thrown away and replaced with the deflection.
+6. The LLM's prompt also instructs it to refuse.
+
+*(On a real device, Gemma-1B answered "you see nothing there" to "is anything in my way?"
+while a book, a person and furniture were all detected. This is why the gate exists.)*
+
+**Full detail on every layer, with the maths and worked examples:**
+📖 [`SECONDSENSE_BIBLE.md`](SECONDSENSE_BIBLE.md)
 
 ---
 
@@ -18,196 +135,132 @@ are a commodity.
 
 | Area | State |
 |---|---|
-| Vision pipeline (YOLO26s + Depth-Anything-V2) on **TFLite** | live on-device (CPU/XNNPACK for YOLO, NNAPI for depth) |
-| Sonification spine — 3 orthogonal channels + haptics + WHITE/BLUE/RED tiers | live, unit-tested |
-| Drop-off / negative-obstacle detection (V3: IMU corridor + RGB edge lattice + depth-as-evidence fusion) | live |
-| YamNet hazard-sound detection + speech auto-ducking | live (keyword thresholds not yet field-validated) |
-| Barometer descent cross-check | works on a device with a barometer (the iQOO 15 has one) |
-| Live laptop dashboard + QR (offline, local network) | live |
-| Voice goal-seeking — grounding half (spoken noun to COCO detection to steering) | live on TFLite |
-| Voice goal-seeking — ASR half (speech to word) | optional: bundle **sherpa-onnx** (`-PenableSherpa`, see [`android/app/src/sherpa/README.md`](android/app/src/sherpa/README.md)); otherwise reports "not loaded" |
-| Hexagon **NPU / QNN** path | fully implemented, blocked by an OEM device-access gate (`QNN_DEVICE_ERROR_INVALID_CONFIG`) on retail hardware — kept for a future unblock |
-| True open-vocabulary grounding (OWL-ViT / YOLO-World) | roadmap — no working TFLite export; needs the NPU path |
+| Vision pipeline (YOLO + Depth-Anything-V2) on the **Hexagon NPU (QNN)** | **working** on the iQOO 15 (`-PenableQnnNative=true`) |
+| Same pipeline on plain CPU (**TFLite**) / **MOCK** for testing | working — the app never hard-crashes; missing models fall back to MOCK |
+| Sonification spine — 3 orthogonal channels + graded haptics + tiers | live, unit-tested |
+| Drop-off detection (edge lattice + depth + ground-plane + object-suppression + barometer) | live, unit-tested; **not yet field-tested on real drops** |
+| Specular-Trap vetoes (shadow chromaticity · ground-flow coplanarity · barometer re-escalation) | live, unit-tested; **needs real puddle/shadow/marble footage** |
+| Camera tamper / occlusion / knocked-off-angle detection | live |
+| Activity-context system — 6 modes, thermal-merge, earcons | live, unit-tested |
+| Context auto-detection (footsteps + vehicle-vibration signature) | live; **threshold needs a real walk + bus ride** |
+| Thermal governor (4 signals, warm-up guard, relative baseline) | live; downshift verified; **full soak proof pending** |
+| Voice — one-tap wake + ~15-intent grammar (find / read / status / call / timer / mode / …) | live, unit-tested (78-phrase judge sweep) |
+| Voice — on-device LLM fallback (Gemma-3-1B-IT, MediaPipe) | works with `-PenableLlm=true` + a side-loaded `.task`; weak — a long-tail helper only |
+| **Safety gate** (Tier 1 templates + Tier 2 learned classifier) | live; classifier scores **100 %** on held-out phrases in 3 languages |
+| Panic gesture (both volume keys 2 s) | live |
+| Sign reading — Latin + Devanagari OCR + on-device Hindi↔English translation | live; translation needs its one-time Wi-Fi model download |
+| Blind-first UI — full-screen gesture surface, spoken menu, volume-key mapping, TalkBack fallback | live; **needs a hands-on session with a blind user** |
+| Hazard-sound detection (car horns, sirens) + speech auto-ducking | live; thresholds not field-validated |
+| Laptop live 3-D room reconstruction demo (`laptop/room3d/`) | works end to end against the live phone; soft on a CPU-only laptop |
+| Persistent AR room map (walk-once, route later) | steps 1–4 built; routing not built — **parked** |
+| Open-vocabulary grounding + on-NPU Whisper | roadmap — currently uses Android's speech recogniser + the 80 COCO classes (with synonyms) |
 
 ---
 
-## How it works
+## Quick start
 
-```
-CameraX frame (rotated upright)
-  -> InferenceEngine.infer()            <- the swap seam: MOCK | TFLITE | QNN
-      |- YOLO26s        -> YoloDecoder (layout-sniffing + NMS)  -> detections
-      |- Depth-Anything-V2 (every 2nd frame) -> EMA smooth -> DepthSampler -> per-box proximity
-      |- RED-tier synthesis (depth sees something, YOLO named nothing)
-      |- Lucas-Kanade ego-motion -> MotionTracker (moving / approaching)
-      \- V3 hazard fusion: IMU corridor + EdgeLattice + ground-plane depth evidence
-                           + YOLO object-mask suppression -> HazardStateMachine
-  -> FrameResult
-  -> MainActivity:
-      |- hazard state -> distinct haptic (edge-triggered) + barometer cross-check
-      |- voice goal active? -> GoalGrounding (match noun to a COCO detection) -> steer
-      |- TargetSelector (center-crop, closest, moving-beats-static) -> TierClassifier
-      |- Calibration (one-tap baseline) -> TemporalSmoother (~3-frame persistence)
-      \- CueEngine  <- continuous loop, own thread
+Requires **Android Studio** (Koala 2024.1+) or a cached Gradle 8.13.
+
+```bash
+cd android
+
+# Build with Android Studio's bundled JBR (a system JDK 24 will fail):
+export JAVA_HOME="/path/to/Android Studio/jbr"        # or set it in Android Studio
+
+# First build needs network (ML Kit + translate + ARCore deps). After that, --offline is fine.
+gradle :app:assembleDebug :app:testDebugUnitTest      # green with NO model files → falls back to MOCK
+gradle :app:installDebug                              # with a device attached
 ```
 
-**The one rule the `CueEngine` exists to protect — three orthogonal channels, no bleed:**
+**Optional build flags:**
 
-| Dimension | Channel | Never |
-|---|---|---|
-| Direction (azimuth) | equal-power stereo **pan** | — |
-| Distance / urgency | **pulse repetition rate** (faster = closer) | never pitch |
-| Identity | **timbre** — synthesized auditory icon, or sped-up-TTS spearcon fallback | never rate |
-| Proximity (parallel) | **graded haptics** — a *primary* channel, not a backstop | — |
-| Confidence | grainy **texture** (BLUE/RED) — sounds unsure, never silent | never fakes crispness |
+| Flag | Adds |
+|---|---|
+| `-PenableQnnNative=true` | the Hexagon NPU path (needs the Qualcomm QAIRT SDK + the `.so` in `jniLibs/`) |
+| `-PenableLlm=true` | the on-device Gemma path + the MediaPipe runtime (~120 MB). The ~530 MB model is **side-loaded**, never bundled — see [`android/app/src/llm/README.md`](android/app/src/llm/README.md) |
+| `-PenableSherpa=true` | offline keyword-spotting ASR — see [`android/app/src/sherpa/README.md`](android/app/src/sherpa/README.md) |
 
-Everything downstream of `InferenceEngine` (the `inference/decode/` layer and the whole
-sonification stack) is runtime-agnostic — it speaks in flat `RawTensor`s — so the QNN engine
-reuses it unchanged when the NPU is unblocked.
+**The engine switch** is one line — [`inference/EngineConfig.kt`](android/app/src/main/java/ai/secondsense/app/inference/EngineConfig.kt):
+
+```kotlin
+val KIND: Kind = Kind.QNN   // MOCK (no models) · TFLITE (universal) · QNN (Hexagon NPU)
+```
+
+### Laptop 3-D room demo
+
+```bash
+cd laptop
+pip install -r room3d/requirements.txt          # fresh venv; scrcpy optional
+python -m room3d.record --source phone:<IP> --out sweep.mp4 --seconds 120   # slow room sweep
+python -m room3d.app    --source file:sweep.mp4                             # reconstruct + view
+```
+
+The phone serves frames at `http://<phone-ip>:8085/frame.jpg` (same Wi-Fi, no internet). See
+[`laptop/room3d/README.md`](laptop/room3d/README.md).
 
 ---
 
 ## Repo layout
 
 ```
-android/                         Native Android app (Kotlin) — the thing that runs on the phone
+android/                          the app that runs on the phone (Kotlin)
   app/src/main/java/ai/secondsense/app/
-    inference/       engine seam + MOCK/TFLITE/QNN engines; decode/ = shared, runtime-agnostic
-    sonification/    the crown jewel — CueEngine, TargetSelector, TierClassifier, DegradationLadder,
-                     ModeController, AuditoryIcon, Spearcon, TemporalSmoother, Calibration
-    output/          AudioOutput (pan), HapticOutput (graded + distinct hazard patterns)
-    sensors/         ImuTracker (pitch/roll for the corridor), BarometerMonitor
-    audio/           MelSpectrogram (hand-rolled FFT) + HazardSoundDetector (YamNet)
-    voice/           Phase 4 — VoiceCommandCapture, GoalGrounding, VectorToGoalController,
-                     VoiceRecognizers (picks sherpa KWS if present, else the QNN stub)
-    dashboard/       embedded NanoHTTPD dashboard + offline QR
-    ui/              MainActivity (text HUD — the real UI is audio/haptics), DebugActivity
-  app/src/sherpa/    OPTIONAL offline-ASR module, compiled only with -PenableSherpa (README inside)
-  app/src/main/cpp/  QNN native JNI bridge (compiled only with -PenableQnnNative)
+    inference/        engine seam (MOCK | TFLITE | QNN); decode/ = shared, runtime-agnostic fusion
+    inference/decode/ hazard state machine, Specular-Trap vetoes, ground-plane, optical flow
+    sonification/     CueEngine, TargetSelector, TierClassifier, Earcons, AuditoryIcon, Spearcon
+    output/           AudioOutput (pan), HapticOutput (graded + per-hazard patterns)
+    context/          AppContext (6 modes), ContextManager, ContextAutoDetector
+    voice/            IntentInterpreter, LlmAssistant + LlmPrompt, SafetyGate, NgramSafetyGate,
+                      SafetyGateWeights (generated), GoalGrounding, PhoneActions
+    perf/             ThermalGovernor, PerfPolicy
+    perception/       MlKitPerception (OCR + faces), OcrTranslator, LanguagePrefs
+    sensors/          ImuTracker, BarometerMonitor, PedometerTracker
+    ar/               experimental persistent room map (parked)
+    dashboard/        embedded NanoHTTPD spectator dashboard + /frame.jpg
+    ui/               MainActivity (the real UI is audio + haptics + gestures)
+  app/src/llm/        flag-gated MediaPipe LLM assistant (-PenableLlm)
+  app/src/main/cpp/   QNN native JNI bridge (-PenableQnnNative)
 
-convert.py, models.json, scripts/   Laptop -> Qualcomm AI Hub model-conversion pipeline
-debug_*.py                          Offline validation harness — run a bundled .tflite against a
-                                    real photo in ~2 s (validate every model/algorithm change here first)
-docs/                               Phase-0 pre-event tickets + the QAI Hub toolchain runbook
-secondsense_bible_v4*.md            The "why": vision, sonification design, ethical invariants, pitch
-secondsense_build_map_v3.md         The "what/when": 43 tickets, phases 0-7, per-ticket test steps
-secondsense_handoff_v*.md           Session handoffs — live status snapshots
-secondsense_research_candidates_v*.md   Adjudicated research: every candidate model/algorithm, graded
+laptop/
+  room3d/             live 3-D room reconstruction demo (Python, Open3D)
+  tools/              train_safety_gate.py — trains the Tier-2 classifier, bakes weights into Kotlin
+
+SECONDSENSE_BIBLE.md  the complete technical bible — every layer, the maths, worked examples,
+                      edge-case tables, how to test each piece (no code)
+debug_*.py            offline validation harness — run a bundled model against a real photo
 ```
-
----
-
-## Build & run
-
-Requires **Android Studio** (Koala 2024.1+). Two host-specific gotchas from `secondsense-android-build`:
-
-- Build with **Android Studio's bundled JBR (JDK 21)** — a system JDK 24 fails.
-  `JAVA_HOME="…/Android Studio/jbr"`.
-- No committed Gradle wrapper JAR — open in Android Studio (it regenerates it) or run
-  `gradle wrapper --gradle-version 8.13` once.
-
-```bash
-cd android
-# create local.properties (SDK path) if Android Studio hasn't:
-echo "sdk.dir=/path/to/Android/Sdk" > local.properties
-
-./gradlew :app:assembleDebug :app:testDebugUnitTest    # green with NO model files (falls back to MOCK)
-./gradlew :app:installDebug                             # with a device attached
-```
-
-**The engine switch** is one line — [`inference/EngineConfig.kt`](android/app/src/main/java/ai/secondsense/app/inference/EngineConfig.kt):
-
-```kotlin
-val KIND: Kind = Kind.TFLITE   // MOCK (no models) | TFLITE (default demo path) | QNN (NPU, blocked)
-```
-
-### Model assets (not in the repo — see below)
-
-For `Kind.TFLITE` the app needs these in `android/app/src/main/assets/models/`:
-
-| File | How to get it |
-|---|---|
-| `yolov11_det.tflite` | `python convert.py --device "<snapdragon>" --runtime tflite --only yolo26_det` (exported under this filename) |
-| `depth_anything_v2.tflite` | `python convert.py --device "<snapdragon>" --runtime tflite --only depth_anything_v2` |
-| `yamnet.tflite` | `python convert.py --device "<snapdragon>" --runtime tflite --only yamnet` |
-
-`README.txt` and `yamnet_labels.txt` in that folder are kept in the repo. If `TFLITE` is
-selected but a model is missing, the app logs it and falls back to `MOCK` — the demo never
-hard-crashes.
-
-### Optional native modules
-
-- **QNN / Hexagon NPU** — `-PenableQnnNative=true` + `qnn.sdk.root` in `gradle.properties` +
-  the Qualcomm QNN `.so` in `app/src/main/jniLibs/arm64-v8a/`. See
-  [`android/README.md`](android/README.md). Currently blocked by an OEM access gate.
-- **Offline ASR (sherpa-onnx)** — `-PenableSherpa=true` + wrapper sources + `.so` + KWS model.
-  See [`android/app/src/sherpa/README.md`](android/app/src/sherpa/README.md).
-
----
-
-## Laptop model-conversion pipeline
-
-Turns Qualcomm AI Hub zoo models into NPU-native `qnn_context_binary` and universal `.tflite`.
-Compile/profile jobs run on **Qualcomm's cloud** (needs an AI Hub account token + network).
-
-```bash
-./setup_qai_hub.ps1        # or ./setup_qai_hub.sh — venv + pinned deps (qai-hub 0.55.0)
-python scripts/verify_setup.py                 # works with NO token
-qai-hub configure --api_token <YOUR_TOKEN>     # https://aihub.qualcomm.com/
-python convert.py --dry-run                    # preview
-python convert.py --device "Snapdragon 8 Elite QRD"                    # QNN binaries
-python convert.py --device "Snapdragon 8 Elite QRD" --runtime tflite   # universal TFLite
-```
-
-## Offline validation workflow
-
-Every model swap / threshold / algorithm change is validated **offline first** — a `debug_*.py`
-script loads the exact bundled `.tflite` and runs it against a real photo in ~2 s, before any
-Kotlin is written or any phone is touched. The test fixtures (`bottle.jpeg`, `stairs*.jpeg`,
-…) are kept in the repo so this reproduces.
 
 ---
 
 ## Design invariants (do not regress)
 
-1. The laptop is **never** a runtime dependency — the app is self-contained, proven via a live airplane-mode toggle.
-2. Depth is **relative proximity `0..1`, never metres** — the type is `proximity: Float`.
-3. **Distance = pulse rate, identity = timbre, direction = pan.** No channel drives two dimensions.
-4. Haptics are a **primary** graded channel, not a `<0.5 m` panic backstop.
-5. Confidence tiering is **derived from signal**; on RED the label is **nulled** — the system never claims an identity it doesn't have.
-6. Every degradation path is **total** — never silence-by-omission; PANIC is an independent floor.
-7. Validate every model/algorithm change **offline first** (`debug_*.py`).
-
----
-
-## Documentation
-
-| Doc | What it is |
-|---|---|
-| [`secondsense_bible_v4.md`](secondsense_bible_v4.md) | The why — vision, sonification design, competitive analysis, pitch |
-| [`secondsense_bible_v4_addendum_session4.md`](secondsense_bible_v4_addendum_session4.md) | The reasoning behind the on-device bring-up decisions |
-| [`secondsense_build_map_v3.md`](secondsense_build_map_v3.md) | 43 tickets, phases 0-7, per-ticket build/test steps |
-| [`secondsense_handoff_v3.md`](secondsense_handoff_v3.md) | Latest session handoff (status snapshot) |
-| [`secondsense_research_candidates_v1.md`](secondsense_research_candidates_v1.md) + `v2` | Every candidate model/algorithm, graded verified vs. unconfirmed |
-| [`secondsense_phase7_proof_kit.md`](secondsense_phase7_proof_kit.md) | Metrics-table / demo / pitch templates |
-| [`android/README.md`](android/README.md) | App-level detail + the QNN drop-in point |
-| [`TFLITE_INTEGRATION.md`](TFLITE_INTEGRATION.md) | The TFLite test-path integration notes |
+1. The laptop / any network is **never** a runtime dependency — proven via an airplane-mode toggle.
+2. Depth is **relative proximity `0..1`**, never metres, in the live cue path.
+3. **Direction = pan, distance = pulse rate, identity = timbre.** No channel drives two dimensions.
+4. Haptics are a **primary** graded channel, not a "< 0.5 m" panic backstop.
+5. Confidence is **derived from signal**; on RED the identity label is nulled — it never claims
+   an identity it doesn't have.
+6. Every degradation path is **total** — never silence-by-omission. The imminent-collision
+   haptic is an independent floor that pause / mute / context / heat cannot disable.
+7. **The language model never answers "is it safe."** Six layers enforce it.
+8. Many small independent checks that vote — not one monolithic model.
 
 ---
 
 ## Not in the repo (and why)
 
-- **`android/app/src/main/assets/models/*.tflite` / `*.bin`** — 15–95 MB each; regenerate with `convert.py`.
-- **`android/app/src/main/jniLibs/`** — Qualcomm QNN runtime `.so` (proprietary, not redistributed) and, if you add it, the sherpa-onnx `.so`. Obtain from the respective SDK / release.
-- **`venv/`, `export_assets/`, `logs/`, `*.pt`, `second.zip`** — generated, downloadable, or large.
-
-If you want turnkey `git clone` -> build, add the model assets via **Git LFS** instead of the
-`.gitignore` rules for `assets/models/`.
+- **`android/app/src/main/assets/models/*.tflite` / `*.bin`** — 15–95 MB each; regenerate with
+  `convert.py` (Qualcomm AI Hub pipeline).
+- **`android/app/src/main/jniLibs/`** — proprietary Qualcomm QNN runtime `.so` (not
+  redistributed).
+- **The Gemma `.task` model** (~530 MB) — side-loaded to the device, never committed.
+- **`*.task`, `*.onnx`, `*.ply`, `venv/`, build output** — generated, downloadable, or large.
 
 ---
 
+<div align="center">
+
 *Prototype / hackathon project. Blindfolded-sighted testing is a proxy, not validation — real
-blind/low-vision co-design is the honest next step before any deployment.*
-#   s e c o n d s e n s e 
- 
- 
+blind and low-vision co-design is the honest next step before any deployment.*
+
+</div>

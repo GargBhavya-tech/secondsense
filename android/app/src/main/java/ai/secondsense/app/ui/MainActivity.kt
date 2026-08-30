@@ -218,6 +218,7 @@ class MainActivity : AppCompatActivity() {
     // "find X" demo safety-net: when the goal was set, and whether it's ever been seen.
     @Volatile private var goalSetAtMs = 0L
     @Volatile private var goalEverSeen = false
+    @Volatile private var goalNudgedAtMs = 0L
 
     // Problem Statement 6 — thermal throttling / deterministic latency in the closed harness.
     private val thermalGovernor by lazy { ThermalGovernor(walkingSupplier = { pedometer.isWalking }) }
@@ -402,7 +403,7 @@ class MainActivity : AppCompatActivity() {
             onResult = { result -> onFrameResult(result) },
             frameSink = { bmp ->
                 lastFrameForOcr = bmp   // kept for a one-shot "read this" even when aux OCR is off
-                if (perceptionEnabled) perception.offer(bmp)
+                if (perceptionEnabled && !paused) perception.offer(bmp)
                 publishFrameForDemo(bmp)   // throttled JPEG -> DashboardServer /frame.jpg (laptop 3D demo)
             },
         )
@@ -514,14 +515,16 @@ class MainActivity : AppCompatActivity() {
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
                 if (surfaceInactive() || gMaxPointers >= 2) return false
                 if (menuOpen) return true
-                tapToTalk()   // one tap anywhere = wake + listen (Phase 3)
+                // Top third = "what's around me" (offline, no mic). Rest of the screen = wake
+                // the assistant and listen.
+                if (e.y < rootH() * 0.33f) narrateScene() else tapToTalk()
                 return true
             }
 
             override fun onDoubleTap(e: MotionEvent): Boolean {
                 if (surfaceInactive() || gMaxPointers >= 2) return false
                 if (menuOpen) { menuActivate(); return true }
-                narrateScene()   // offline "what's ahead" — no mic, for noisy places
+                narrateScene()   // also on double-tap anywhere, for muscle memory
                 return true
             }
 
@@ -723,11 +726,17 @@ class MainActivity : AppCompatActivity() {
             MotionEvent.ACTION_POINTER_DOWN ->
                 gMaxPointers = maxOf(gMaxPointers, ev.pointerCount)
             MotionEvent.ACTION_MOVE ->
-                if (kotlin.math.hypot((ev.x - gStartX).toDouble(), (ev.y - gStartY).toDouble()) > 60) gMoved = true
+                // multi-finger taps naturally drift more than one finger — looser tolerance
+                if (kotlin.math.hypot((ev.x - gStartX).toDouble(), (ev.y - gStartY).toDouble()) > 130) gMoved = true
             MotionEvent.ACTION_UP -> {
-                val quick = System.currentTimeMillis() - gStartMs < 320 && !gMoved
-                if (quick && gMaxPointers >= 3) speakHelp()
-                else if (quick && gMaxPointers == 2) { if (menuOpen) closeSpokenMenu() else togglePause() }
+                // 2- and 3-finger taps take longer to land + lift than a single tap; be generous.
+                // gMaxPointers is left as-is so the delayed single-tap callback still bails on it;
+                // the next ACTION_DOWN resets it to 1.
+                val elapsed = System.currentTimeMillis() - gStartMs
+                if (elapsed < 750 && !gMoved && gMaxPointers >= 3) speakHelp()
+                else if (elapsed < 700 && !gMoved && gMaxPointers == 2) {
+                    if (menuOpen) closeSpokenMenu() else togglePause()
+                }
             }
         }
     }
@@ -1377,15 +1386,23 @@ class MainActivity : AppCompatActivity() {
         val result = raw.copy(detections = stabilizer.update(raw.detections))
         lastResult = result
 
-        handleCameraHealth(result.cameraHealth)
-
-        // SAFETY FLOOR — runs in EVERY context, even Sitting/Transit where the hazard pipeline
-        // is off: something within arm's reach and closing fast still earns one haptic.
+        // SAFETY FLOOR — runs in EVERY context AND even while paused: something within arm's
+        // reach and closing fast still earns one haptic. This is the only thing pause can't kill.
         val imminent = result.detections.any { it.proximity >= 0.90f && it.approaching >= 0.12f }
         if (imminent && System.currentTimeMillis() - lastFloorMs > 3000L) {
             lastFloorMs = System.currentTimeMillis()
             haptics.possibleDrop()
         }
+
+        // PAUSED = go quiet. No spoken cues, no hazard talk, no sign/face reading, no goal
+        // seeking, no camera-health nags — just the safety-floor haptic above and the big
+        // status word. Resumes exactly where it left off.
+        if (paused) {
+            runOnUiThread { updateBigStatus() }
+            return
+        }
+
+        handleCameraHealth(result.cameraHealth)
 
         // OBJECT MEMORY: a named object just came to rest in view -> log where it is, in the
         // dead-reckoned local frame. Cheap; only consulted by a later "where is my X" query.
@@ -1468,17 +1485,36 @@ class MainActivity : AppCompatActivity() {
         // clear the goal, fall back to the obstacle spine.
         val goalMatch = if (modeController.acceptsVoiceCommands)
             GoalGrounding.match(result.detections, vectorToGoal.activeGoal) else null
-        // Demo safety-net: a spoken Find target that the detector can't recognise (not a COCO
-        // class, e.g. "keys") would otherwise just sit there silently. If it's never once been
-        // seen within ~7 s, say so and drop it instead of leaving the user waiting.
+        // Find safety-net. A word we genuinely can't recognise (e.g. "keys", "door") fails fast
+        // with an honest message. A word we *can* recognise ("bag", "chair", "phone") gets a
+        // long look — a "keep turning" nudge at 14 s, and only gives up at 40 s.
         if (vectorToGoal.isActive && !memoryNavActive) {
-            if (goalMatch != null) goalEverSeen = true
-            else if (!goalEverSeen && goalSetAtMs > 0 && System.currentTimeMillis() - goalSetAtMs > 7_000L) {
+            if (goalMatch != null) {
+                goalEverSeen = true
+            } else if (!goalEverSeen && goalSetAtMs > 0) {
+                val since = System.currentTimeMillis() - goalSetAtMs
                 val g = vectorToGoal.activeGoal
-                vectorToGoal.setGoal(null); goalSetAtMs = 0L
-                runOnUiThread {
-                    announce("I can't see a $g. I can only spot common things like people, chairs, doors, bottles and bags.")
-                    modeController.set(OperatingMode.FLOW)
+                val groundable = GoalGrounding.isGroundable(g)
+                when {
+                    !groundable && since > 6_000L -> {
+                        vectorToGoal.setGoal(null); goalSetAtMs = 0L
+                        runOnUiThread {
+                            announce("I can't look for a $g. I can only find common things like " +
+                                "people, chairs, bags, bottles, laptops and phones. Say never mind to stop.")
+                            modeController.set(OperatingMode.FLOW)
+                        }
+                    }
+                    groundable && since > 14_000L && goalNudgedAtMs < goalSetAtMs -> {
+                        goalNudgedAtMs = System.currentTimeMillis()
+                        runOnUiThread { announce("Still looking for the $g. Turn around slowly so I can see more.") }
+                    }
+                    groundable && since > 40_000L -> {
+                        vectorToGoal.setGoal(null); goalSetAtMs = 0L
+                        runOnUiThread {
+                            announce("I still haven't spotted a $g. Stopping the search.")
+                            modeController.set(OperatingMode.FLOW)
+                        }
+                    }
                 }
             }
         }

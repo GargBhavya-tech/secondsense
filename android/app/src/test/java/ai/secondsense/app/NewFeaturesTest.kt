@@ -763,6 +763,34 @@ class NgramSafetyGateTest {
     }
 }
 
+/** GoalGrounding: everyday spoken words reach the detector labels; unknowns are flagged. */
+class GoalGroundingTest {
+    private fun det(label: String, cx: Float = 0.5f, prox: Float = 0.5f) =
+        ai.secondsense.app.inference.Detection(
+            label = label, score = 0.9f,
+            box = ai.secondsense.app.inference.BBox(cx - 0.1f, 0.4f, cx + 0.1f, 0.6f),
+            proximity = prox,
+        )
+
+    @Test fun synonymsMatchDetectorLabels() {
+        val gg = ai.secondsense.app.voice.GoalGrounding
+        assertTrue("bag -> backpack", gg.match(listOf(det("backpack")), "bag") != null)
+        assertTrue("sofa -> chair", gg.match(listOf(det("chair")), "sofa") != null)
+        assertTrue("phone -> cell phone", gg.match(listOf(det("cell phone")), "phone") != null)
+        assertNull("no chair in view", gg.match(listOf(det("person")), "bag"))
+    }
+
+    @Test fun groundableTellsFindableFromNot() {
+        val gg = ai.secondsense.app.voice.GoalGrounding
+        assertTrue(gg.isGroundable("bag"))
+        assertTrue(gg.isGroundable("chairs"))
+        assertTrue(gg.isGroundable("phone"))
+        assertFalse(gg.isGroundable("keys"))
+        assertFalse(gg.isGroundable("door"))
+        assertFalse(gg.isGroundable(null))
+    }
+}
+
 /** Earcons: every context gets a distinct, non-empty tone shape. */
 class EarconsTest {
     @Test fun everyContextHasADistinctSequence() {
