@@ -83,5 +83,14 @@
             android:exported="false"
             android:screenOrientation="portrait"
             android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- "Classic" build: the exact pre-AI-integration MainActivity (commit 4ec5339) —
+             camera + YOLO/depth + sonification + hazards + closed-vocab voice goal-seek, no
+             IntentInterpreter / LLM / context auto-detect. Opened from the admin panel. -->
+        <activity
+            android:name=".ui.ClassicActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
     </application>
 </manifest>

@@ -107,8 +107,19 @@ class CueEngine(
         }
     }
 
+    @Volatile private var lastPulseLogMs = 0L
+
     /** Render one pulse across audio (icon, panned) + haptics (graded), tier-shaped. */
     private fun fireOnePulse(target: CueTarget) {
+        val nowMs = System.currentTimeMillis()
+        if (nowMs - lastPulseLogMs >= 1000L) {
+            lastPulseLogMs = nowMs
+            android.util.Log.i(
+                "SecondSense/cue",
+                "pulse ${target.label ?: "?"} az=${"%.2f".format(target.azimuth)} " +
+                    "prox=${"%.2f".format(target.proximity)} tier=${target.tier}",
+            )
+        }
         val dur = pulseDurationMs(target.proximity)
         val duck = duckFactorFor(target) // #34, urgency-aware — see duckFactorFor's doc comment
 

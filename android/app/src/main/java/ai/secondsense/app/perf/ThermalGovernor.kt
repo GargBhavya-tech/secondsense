@@ -49,6 +49,10 @@ class ThermalGovernor(
     @Volatile var policy: PerfPolicy = PerfPolicy.policyFor(ThermalTier.NOMINAL, walking = true)
         private set
 
+    /** headroom-signal trust: 0 = still calibrating, 1 = trusted, -1 = device stubs the API. */
+    private var headroomTrust = 0
+    private var headroomPolls = 0
+
     private var power: PowerManager? = null
     private var appContext: Context? = null
     private val handler = Handler(Looper.getMainLooper())
@@ -125,6 +129,24 @@ class ThermalGovernor(
     private fun sampleHeadroom() {
         if (Build.VERSION.SDK_INT < 30) return
         headroom = runCatching { power?.getThermalHeadroom(60) ?: Float.NaN }.getOrDefault(Float.NaN)
+
+        // Many non-Pixel SoCs (seen on the vivo/iQOO 15) do not implement getThermalHeadroom()
+        // and return a pinned ~1.0 from the very first poll. Taken at face value that reads as
+        // CRITICAL forever, which decimates the frame rate and starves the cue pipeline even
+        // though the OS thermal status is NONE and the battery is cold. Calibrate once: if the
+        // early readings sit at/above ~0.95 while the two AUTHORITATIVE signals (OS status +
+        // battery temp) both say cool, treat this device's headroom as unusable for the session.
+        if (headroomTrust == 0 && !headroom.isNaN()) {
+            headroomPolls++
+            val othersCool = statusTier == ThermalTier.NOMINAL &&
+                (batteryTempC.isNaN() || batteryTempC < 40f)
+            if (headroom >= 0.95f && othersCool) {
+                headroomTrust = -1
+                Log.i(TAG, "headroom API looks stubbed (pinned ${headroom} while cool) -> ignoring it")
+            } else if (headroomPolls >= 4) {
+                headroomTrust = 1
+            }
+        }
     }
 
     private fun sampleBatteryTemp() {
@@ -145,11 +167,13 @@ class ThermalGovernor(
     fun stop() {
         running = false
         windowsComputed = 0; latIdx = 0; latFilled = 0; baselineMs = 0L
+        headroomTrust = 0; headroomPolls = 0
         runCatching { power?.removeThermalStatusListener(thermalListener) }
         handler.removeCallbacks(poll)
     }
 
     private fun headroomTier(): ThermalTier = when {
+        headroomTrust == -1 -> ThermalTier.NOMINAL   // device stubs the API — see sampleHeadroom()
         headroom.isNaN() -> ThermalTier.NOMINAL
         headroom >= 0.98f -> ThermalTier.CRITICAL
         headroom >= 0.93f -> ThermalTier.HOT
@@ -167,7 +191,14 @@ class ThermalGovernor(
 
     @Synchronized
     private fun reassess() {
-        val raw = maxOf(statusTier, headroomTier(), batteryTier(), latencyTier())
+        // The OS thermal STATUS is the authoritative signal. The three derived signals
+        // (headroom / battery temp / latency ratio) are early-warning nudges — on some devices
+        // headroom is noisy or half-implemented and can read HOT while the SoC is stone cold.
+        // Let them escalate at most ONE tier past what the OS reports, so a bad vendor sensor
+        // can nudge us to power-save but can never strangle the cue pipeline on a cool phone.
+        val derived = maxOf(headroomTier(), batteryTier(), latencyTier())
+        val derivedCap = ThermalTier.values()[(statusTier.ordinal + 1).coerceAtMost(ThermalTier.CRITICAL.ordinal)]
+        val raw = maxOf(statusTier, minOf(derived, derivedCap))
         val now = System.currentTimeMillis()
 
         val next: ThermalTier

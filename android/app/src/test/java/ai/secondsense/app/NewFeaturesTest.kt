@@ -267,6 +267,47 @@ class CameraHealthMonitorTest {
         assertEquals(CameraHealth.BLOCKED, m.update(normal, 0f, 0f, imuCalibrated = false, nowMs = 700L))
         assertEquals(CameraHealth.OK, m.update(normal, 0f, 0f, imuCalibrated = false, nowMs = 1_300L))
     }
+
+    /** A lens covered in DAYLIGHT is bright but textureless — must still read BLOCKED. */
+    @Test fun brightButTexturelessLensReportsBlocked() {
+        val brightFlat = FloatArray(19_200) { 180f }   // mean 180, std 0 — a pale shirt over the lens
+        val m = CameraHealthMonitor(sustainMs = 500L)
+        assertEquals(CameraHealth.OK, m.update(brightFlat, 0f, 0f, imuCalibrated = false, nowMs = 0L))
+        assertEquals(CameraHealth.BLOCKED, m.update(brightFlat, 0f, 0f, imuCalibrated = false, nowMs = 600L))
+    }
+
+    /** Uncalibrated: after the rig's rest pose is learned, a sustained tilt CHANGE is MISALIGNED. */
+    @Test fun uncalibratedKnockedMountReportsMisaligned() {
+        val m = CameraHealthMonitor(sustainMs = 500L, autoTiltDeltaDeg = 17f)
+        // ~15 healthy frames at the resting pose (-70° chest-mount pitch) to warm the baseline.
+        repeat(15) { i -> m.update(normal, pitchDeg = -70f, rollDeg = 0f, imuCalibrated = false, nowMs = i * 100L) }
+        // Mount gets knocked 30° — well past the 17° delta.
+        m.update(normal, pitchDeg = -40f, rollDeg = 0f, imuCalibrated = false, nowMs = 1_600L)
+        assertEquals(
+            CameraHealth.MISALIGNED,
+            m.update(normal, pitchDeg = -40f, rollDeg = 0f, imuCalibrated = false, nowMs = 2_200L),
+        )
+        // Put it back -> clears.
+        m.update(normal, pitchDeg = -70f, rollDeg = 0f, imuCalibrated = false, nowMs = 2_300L)
+        assertEquals(
+            CameraHealth.OK,
+            m.update(normal, pitchDeg = -70f, rollDeg = 0f, imuCalibrated = false, nowMs = 3_400L),
+        )
+    }
+
+    /** Uncalibrated: normal walking bob (a few degrees, briefly) must NOT trip MISALIGNED. */
+    @Test fun uncalibratedWalkingBobStaysOk() {
+        val m = CameraHealthMonitor(sustainMs = 1_500L, autoTiltDeltaDeg = 17f)
+        var t = 0L
+        repeat(40) { i ->
+            val bob = if (i % 2 == 0) 6f else -6f     // ±6° oscillation
+            assertEquals(
+                CameraHealth.OK,
+                m.update(normal, pitchDeg = -70f + bob, rollDeg = bob / 2f, imuCalibrated = false, nowMs = t),
+            )
+            t += 120L
+        }
+    }
 }
 
 /** Thermal governor: the perf policy escalates monotonically and keeps a safety floor. */

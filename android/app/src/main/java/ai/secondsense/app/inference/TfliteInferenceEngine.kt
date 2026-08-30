@@ -109,7 +109,11 @@ class TfliteInferenceEngine(
     // showed this exact yolo26s model running in 5.3ms with clean accuracy on that chipset,
     // so this CPU fallback is a TEST-PHONE-ONLY workaround, not the production plan.
     private val useNnapiYolo = false
-    private val useNnapiDepth = true
+    // Was `true` "for speed" on a MediaTek test phone. On the iQOO 15 (vivo) NNAPI silently
+    // routes the depth graph through a slow reference path — measured ~2.5 s PER FRAME, which
+    // freezes the whole cue pipeline. CPU/XNNPACK is ~10x faster here. The real fast path is
+    // the QNN NPU build (-PenableQnnNative); this keeps the plain TFLite build usable.
+    private val useNnapiDepth = false
     private val nnapiDelegates = mutableListOf<NnApiDelegate>()
 
     // PERF: depth is the heavy model; run it every Nth frame and reuse the last map in
@@ -161,9 +165,36 @@ class TfliteInferenceEngine(
         depthOutBuffer = ByteBuffer.allocateDirect(depth!!.getOutputTensor(0).numBytes())
             .order(ByteOrder.nativeOrder())
 
+        // Warm the interpreters BEFORE we flip `ready`. XNNPACK repacks weights and allocates
+        // all its partition buffers on the FIRST inference — ~2 s for the 518x518 depth graph
+        // on this SoC. Paid here on the init thread (infer() safely returns empty frames
+        // meanwhile) instead of freezing the user's first ~30 walking frames.
+        warmup()
+
         ready = true
         Log.i(TAG, "ready. yoloInput=$yoloInputSize outShapes=${yoloOutShapes.joinToString { it.joinToString("x") }} " +
             "depthShape=${depthOutShape.joinToString("x")}")
+    }
+
+    /** One throwaway inference per model so the first real frame isn't the one that pays
+     *  XNNPACK's cold-start cost. Best-effort — any failure here is non-fatal. */
+    private fun warmup() {
+        val started = System.nanoTime()
+        runCatching {
+            val blank = Bitmap.createBitmap(yoloInputSize, yoloInputSize, Bitmap.Config.ARGB_8888)
+            val y = yolo!!; val dpt = depth!!
+
+            val ylb = Preprocess.letterbox(blank, yoloInputSize, normalizeTo01 = true)
+            yoloOutBuffers.values.forEach { it.rewind() }
+            y.runForMultipleInputsOutputs(arrayOf<Any>(ylb.buffer), yoloOutBuffers.mapValues { it.value as Any })
+
+            val dlb = Preprocess.letterbox(blank, depthInputSize(dpt), normalizeTo01 = true)
+            depthOutBuffer.rewind()
+            dpt.run(dlb.buffer, depthOutBuffer)
+
+            blank.recycle()
+        }.onFailure { Log.w(TAG, "warmup skipped: ${it.message}") }
+        Log.i(TAG, "warmup done in ${(System.nanoTime() - started) / 1_000_000}ms")
     }
 
     override fun infer(frame: Bitmap, centerCrop: Boolean): FrameResult {

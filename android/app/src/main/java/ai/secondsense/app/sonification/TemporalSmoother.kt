@@ -19,10 +19,15 @@ import kotlin.math.abs
  * (a null frame resets the streak so a new target starts fresh).
  */
 class TemporalSmoother(
-    /** frames a new target must persist before its cue fires (~3, Bible §13.3). */
-    private val confirmFrames: Int = 3,
-    /** how far the azimuth may drift frame-to-frame and still count as "the same" target. */
-    private val azimuthGate: Float = 0.20f,
+    /** frames a new target must persist before its cue fires (Bible §13.3). Two, not three:
+     *  when the frame rate drops (thermal decimation, a slow reference delegate) a walking
+     *  approach moves the target's azimuth enough between frames that a 3-long streak keeps
+     *  resetting and the cue never fires. Two frames still rejects single-frame flicker. */
+    private val confirmFrames: Int = 2,
+    /** how far the azimuth may drift frame-to-frame and still count as "the same" target.
+     *  Wide enough that a real approach (the target sliding across the center band as you
+     *  close on it) stays "the same thing" instead of restarting the streak every frame. */
+    private val azimuthGate: Float = 0.28f,
 ) {
     private var candidate: CueTarget? = null
     private var streak = 0
