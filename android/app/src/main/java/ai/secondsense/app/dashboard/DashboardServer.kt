@@ -20,15 +20,30 @@ import java.util.Collections
 class DashboardServer(port: Int = 8085) : NanoHTTPD(port) {
 
     @Volatile private var stateJson: String = "{}"
+    @Volatile private var frameJpeg: ByteArray? = null
 
     /** Call once per frame with a JSON string describing the current pipeline state. */
     fun publish(json: String) {
         stateJson = json
     }
 
+    /**
+     * Latest camera frame as JPEG bytes, for the laptop-side 3D room demo (laptop/room3d/).
+     * Optional, debug-only: a spectator on the same Wi-Fi can GET /frame.jpg. No effect on the
+     * on-device pipeline beyond one JPEG encode on a throttled subset of frames.
+     */
+    fun publishFrame(jpeg: ByteArray) {
+        frameJpeg = jpeg
+    }
+
     override fun serve(session: IHTTPSession): Response {
         return when (session.uri) {
             "/state.json" -> newFixedLengthResponse(Response.Status.OK, "application/json", stateJson)
+            "/frame.jpg" -> {
+                val f = frameJpeg
+                if (f == null) newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", "")
+                else newFixedLengthResponse(Response.Status.OK, "image/jpeg", f.inputStream(), f.size.toLong())
+            }
             else -> newFixedLengthResponse(Response.Status.OK, "text/html", DASHBOARD_HTML)
         }
     }

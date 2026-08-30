@@ -30,6 +30,11 @@ conversion_manifest.json
 /models/
 /android/models/
 
+# --- room3d demo outputs (saved point clouds / meshes, recorded scrcpy captures) ---
+*.ply
+laptop/**/*.mkv
+laptop/room3d/.venv/
+
 # --- Ad-hoc screenshots (the CV test fixtures used by debug_*.py ARE kept) ---
 baro_check*.png
 dash_check*.png

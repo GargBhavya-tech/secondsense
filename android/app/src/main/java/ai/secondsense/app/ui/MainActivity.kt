@@ -396,6 +396,7 @@ class MainActivity : AppCompatActivity() {
             frameSink = { bmp ->
                 lastFrameForOcr = bmp   // kept for a one-shot "read this" even when aux OCR is off
                 if (perceptionEnabled) perception.offer(bmp)
+                publishFrameForDemo(bmp)   // throttled JPEG -> DashboardServer /frame.jpg (laptop 3D demo)
             },
         )
 
@@ -1221,6 +1222,25 @@ class MainActivity : AppCompatActivity() {
             camera = camHealthShort().removePrefix("camera ").trim(),
             lastSpoken = lastAnnouncement,
         )
+    }
+
+    // Laptop 3D-room demo (laptop/room3d/): push ~every 5th frame as a small JPEG to the
+    // DashboardServer so a laptop on the same Wi-Fi can pull /frame.jpg. Debug-only; off the
+    // hot path except one downscale+encode on a fraction of frames.
+    @Volatile private var demoFrameTick = 0L
+    private fun publishFrameForDemo(bmp: android.graphics.Bitmap) {
+        val srv = dashboardServer ?: return
+        if (demoFrameTick++ % 5L != 0L || bmp.isRecycled) return
+        try {
+            val w = 640
+            val h = (bmp.height * (w.toFloat() / bmp.width)).toInt().coerceAtLeast(1)
+            val small = android.graphics.Bitmap.createScaledBitmap(bmp, w, h, true)
+            val out = java.io.ByteArrayOutputStream(48 * 1024)
+            small.compress(android.graphics.Bitmap.CompressFormat.JPEG, 60, out)
+            if (small !== bmp) small.recycle()
+            srv.publishFrame(out.toByteArray())
+        } catch (_: Throwable) {
+        }
     }
 
     /** One-shot OCR of the latest frame for a spoken "read this" (Phase 3). */

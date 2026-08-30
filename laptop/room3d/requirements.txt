@@ -1,0 +1,23 @@
+# SecondSense laptop-side live 3D room reconstruction (demo only — no phone code).
+# Python 3.10-3.11 recommended. Install into a fresh venv.
+
+# --- core ---
+numpy<2.0                     # Open3D tensor backend is not numpy-2 clean yet
+opencv-python-headless>=4.9   # Laplacian blur check, colour conversions, resize
+
+# --- video ingest: scrcpy (>=2.4, on PATH) -> raw H.264 -> PyAV decode in-process ---
+av>=12.0
+
+# --- monocular metric depth: Depth-Anything-V2-Metric-Indoor-Small (HF) ---
+torch>=2.2                    # CUDA build strongly recommended; CPU works at ~2 FPS
+transformers>=4.40
+
+# --- 3D reconstruction + live viewer ---
+open3d>=0.18                  # a CUDA-enabled wheel unlocks the --gpu frame-to-model path
+
+# --- optional dev-only frame sources (a recorded .mkv / a mirror window) ---
+mss>=9.0
+
+# --- optional accelerators (not required; see README) ---
+# onnxruntime-gpu>=1.18       # faster depth without full TensorRT
+# tensorrt>=10.0              # sub-15 ms depth on RTX
