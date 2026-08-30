@@ -588,6 +588,14 @@ class MainActivity : AppCompatActivity() {
             startActivity(android.content.Intent(this, DebugActivity::class.java))
         }
 
+        // "Classic build" — the exact pre-AI-integration app (commit 4ec5339): camera + YOLO/
+        // depth + sonification + hazards + closed-vocab voice goal-seek, with NO intent
+        // interpreter / on-device LLM / context auto-detection. Its own standalone Activity;
+        // onPause here frees the camera + dashboard port before it starts.
+        binding.btnClassicMode.setOnClickListener {
+            startActivity(android.content.Intent(this, ClassicActivity::class.java))
+        }
+
         // Path B — AR room scan (experimental). Isolated activity; owns the camera via ARCore.
         binding.btnRoomScan.setOnClickListener {
             when (ai.secondsense.app.ar.ArSupport.availability(this)) {
@@ -990,8 +998,10 @@ class MainActivity : AppCompatActivity() {
      * its mount, and again every [CAM_NAG_MS] while it stays bad. Announce recovery once.
      */
     private fun handleCameraHealth(h: CameraHealth) {
-        val bad = h == CameraHealth.BLOCKED || h == CameraHealth.MISALIGNED
-        val wasBad = lastCamHealth == CameraHealth.BLOCKED || lastCamHealth == CameraHealth.MISALIGNED
+        // MISALIGNED is still detected (HUD, camHealthShort(), hazard fusion) but is NOT
+        // spoken — the "Camera has moved. Please straighten it." nag was removed on request.
+        val bad = h == CameraHealth.BLOCKED
+        val wasBad = lastCamHealth == CameraHealth.BLOCKED
         val now = System.currentTimeMillis()
         val hi = langPrefs.speakHindi
         if (bad && (!wasBad || h != lastCamHealth || now - lastCamNagMs > CAM_NAG_MS)) {
@@ -999,8 +1009,6 @@ class MainActivity : AppCompatActivity() {
             val msg = when (h) {
                 CameraHealth.BLOCKED ->
                     if (hi) "कैमरा ढका हुआ है, कृपया इसे साफ़ करें" else "Camera is blocked. Please clear it."
-                CameraHealth.MISALIGNED ->
-                    if (hi) "कैमरा हिल गया है, कृपया इसे सीधा करें" else "Camera has moved. Please straighten it."
                 else -> ""
             }
             speakLocalized(msg, hi, TextToSpeech.QUEUE_FLUSH, "camhealth")
@@ -1091,9 +1099,10 @@ class MainActivity : AppCompatActivity() {
         hazardState: ai.secondsense.app.inference.decode.HazardState?,
     ) {
         if (!sonifying || paused || !contextManager.profile.sonification) return
-        // Camera covered / knocked off its mount: handleCameraHealth() owns that announcement.
-        // Stay out of its way, and never emit a "path looks clear" line off a dead camera.
-        if (result.cameraHealth == CameraHealth.BLOCKED || result.cameraHealth == CameraHealth.MISALIGNED) return
+        // Camera covered: handleCameraHealth() owns that announcement — stay out of its way,
+        // and never emit a "path looks clear" line off a dead camera. (MISALIGNED no longer
+        // silences the chatter, since it's no longer announced.)
+        if (result.cameraHealth == CameraHealth.BLOCKED) return
         val now = System.currentTimeMillis()
 
         // 1) Hazard speech — only on a state change, only every few seconds.

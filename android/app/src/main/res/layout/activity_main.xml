@@ -199,6 +199,14 @@
                 android:layout_marginBottom="8dp"
                 android:text="@string/room_scan" />
 
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnClassicMode"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="8dp"
+                android:text="@string/classic_mode" />
+
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"

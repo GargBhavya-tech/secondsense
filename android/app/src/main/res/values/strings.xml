@@ -9,6 +9,7 @@
     <string name="speak_hindi">Speak in Hindi (हिंदी में सुनें)</string>
     <string name="translate_signs">Translate signs to my language</string>
     <string name="room_scan">Room scan (AR, experimental)</string>
+    <string name="classic_mode">Classic build (pre-AI: cues + hazards only)</string>
     <string name="admin_close">Close admin panel</string>
     <string name="status_walking">WALKING</string>
     <string name="status_sub_default">starting up…</string>
