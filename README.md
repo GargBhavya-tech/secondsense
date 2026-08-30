@@ -157,6 +157,37 @@ while a book, a person and furniture were all detected. This is why the gate exi
 
 ---
 
+## Future scope — a 3-D model of your home and workspace
+
+Right now the 3-D reconstruction (`laptop/room3d/`) is a **spectator demo**: the phone streams
+frames, a laptop assembles a coloured point-cloud of the room. The direction this points is a
+**persistent, on-device 3-D model of the places a user lives and works** — built once by
+walking through, then kept and reused.
+
+**How it would be built.** A one-time guided sweep — the user (or a sighted helper) walks each
+room slowly while the phone runs Depth-Anything (metric-indoor variant) + ARCore 6-DoF pose.
+Frames are fused into a metric mesh + a coarse occupancy grid, objects are detected and pinned
+to world coordinates, and rooms/zones are labelled. The whole model lives in `filesDir` — no
+cloud, re-anchored on later visits by standing at a known spot.
+
+**What it unlocks:**
+
+| Capability | What changes for the user |
+|---|---|
+| **Persistent object memory** | "Where are my keys?" answered from the model — *"usually on the kitchen counter, on your right as you enter"* — not just the ~60-second dead-reckoning window it has today. |
+| **Indoor routing** | "Take me to the front door" → a path **around** known furniture, delivered through the existing directional cue. This is the routing currently parked in `ar/`. |
+| **Zone awareness** | The app knows you're *in the kitchen* vs *the hallway* and can auto-pick the right activity context and vocabulary. |
+| **Change detection** | A chair moved into your usual path, a door now closed, a box left on the floor — flagged as *new* against the baseline, which is exactly the kind of trip hazard a cane finds late. |
+| **Fewer false drop-offs** | A known floor plan lets the hazard state machine tell "there has always been a step here" from "this edge is new" — tightening the Specular-Trap logic. |
+| **Workspace maps** | The same model for an office floor, a workshop, a campus building — shareable with consent, so a venue can publish its own accessibility map. |
+
+**The honest gap.** The reconstruction pipeline works end-to-end as a demo; **persistence,
+semantic labelling, on-phone (not laptop) execution, and routing are not built.** The ARCore
+walk-once map has steps 1–4 (scan → detect → occupancy grid → save/anchor); step 5 — consuming
+it for live navigation — is the parked work this section describes finishing.
+
+---
+
 ## Quick start
 
 Requires **Android Studio** (Koala 2024.1+) or a cached Gradle 8.13.
