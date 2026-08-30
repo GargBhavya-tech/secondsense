@@ -29,12 +29,14 @@ interface SafetyVectorGate {
 
 object SafetyVectorGates {
     fun create(context: Context): SafetyVectorGate {
-        val impl = runCatching {
+        // Prefer the flag-gated e5 embedding gate if it ever ships; otherwise the always-present
+        // learned n-gram classifier ([NgramSafetyGate]) — NOT Noop.
+        val e5 = runCatching {
             Class.forName("ai.secondsense.app.voice.MultilingualE5SafetyGate")
                 .getConstructor(Context::class.java)
                 .newInstance(context.applicationContext) as SafetyVectorGate
         }.getOrNull()
-        return impl ?: NoopSafetyVectorGate
+        return e5 ?: runCatching { NgramSafetyGate() as SafetyVectorGate }.getOrNull() ?: NoopSafetyVectorGate
     }
 }
 

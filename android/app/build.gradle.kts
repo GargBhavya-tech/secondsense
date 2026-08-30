@@ -162,15 +162,12 @@ dependencies {
     // consumes the identical .tflite and is the lower-risk choice for a test harness; move
     // to LiteRT's CompiledModel later if you want its automatic accelerator selection.
 
-    // ---- #30 laptop dashboard + QR ---------------------------------------------
-    // Both fully offline/local — no network dependency beyond the phone's own Wi-Fi/hotspot
-    // interface, which is required for the airplane-mode demo (#31).
-    // NanoHTTPD: tiny embedded HTTP server (~7 classes) serving the dashboard page + live
-    // telemetry JSON to any laptop browser on the same local network.
+    // ---- #30 laptop dashboard ------------------------------------------------------------
+    // Fully offline/local — no network dependency beyond the phone's own Wi-Fi/hotspot
+    // interface, required for the airplane-mode demo (#31). NanoHTTPD: tiny embedded HTTP
+    // server serving the dashboard page + live telemetry JSON (+ /frame.jpg for the laptop
+    // 3D room demo) to any laptop on the same local network.
     implementation("org.nanohttpd:nanohttpd:2.3.1")
-    // ZXing core only (no android-embedded scanning lib needed) — encodes the dashboard URL
-    // as a QR bitmap so a laptop can join by camera-scan instead of typing an IP.
-    implementation("com.google.zxing:core:3.5.3")
 
     // ---- ML Kit — bundled, fully OFFLINE (models ship in the APK, no Play Services fetch) --
     // Text recognition -> read signs / room numbers / bus numbers (Latin script).

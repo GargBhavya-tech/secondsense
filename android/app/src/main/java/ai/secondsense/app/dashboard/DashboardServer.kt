@@ -36,6 +36,29 @@ class DashboardServer(port: Int = 8085) : NanoHTTPD(port) {
         frameJpeg = jpeg
     }
 
+    /**
+     * [start] but tolerant of the port still being held by a just-killed previous instance of
+     * the app (the socket can linger for a second or two after force-stop). Retries a few times
+     * before giving up. Returns true if the server is listening. Call OFF the main thread.
+     */
+    fun startWithRetry(attempts: Int = 6, delayMs: Long = 400L): Boolean {
+        repeat(attempts) { i ->
+            try {
+                start(SOCKET_READ_TIMEOUT, false)
+                Log.i(TAG, "listening on :$listeningPort (attempt ${i + 1})")
+                return true
+            } catch (e: java.io.IOException) {
+                Log.w(TAG, "bind attempt ${i + 1}/$attempts failed: ${e.message}")
+                try {
+                    Thread.sleep(delayMs)
+                } catch (_: InterruptedException) {
+                    return false
+                }
+            }
+        }
+        return false
+    }
+
     override fun serve(session: IHTTPSession): Response {
         return when (session.uri) {
             "/state.json" -> newFixedLengthResponse(Response.Status.OK, "application/json", stateJson)

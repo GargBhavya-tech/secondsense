@@ -742,6 +742,44 @@ class LlmPromptTest {
     }
 }
 
+/** NgramSafetyGate: the learned Tier-2 classifier — safety questions in, everything else out. */
+class NgramSafetyGateTest {
+    private val g = ai.secondsense.app.voice.NgramSafetyGate()
+
+    @Test fun catchesSafetyQuestionsAcrossPhrasingAndScript() {
+        listOf(
+            "is it safe to cross", "can I walk now", "is the path clear",
+            "will I bump into anything", "am I clear to go", "are there obstacles ahead",
+            "क्या रास्ता साफ है", "kya main ab chal sakta hoon",
+        ).forEach { assertTrue("should flag: \"$it\"", g.isSafetyQuery(it)) }
+    }
+
+    @Test fun passesNonSafetySpeech() {
+        listOf(
+            "find my keys", "read the sign", "what's my battery", "call mom",
+            "set a timer for five minutes", "speak hindi", "I'm sitting down",
+            "what's ahead", "tell me a joke", "",
+        ).forEach { assertFalse("should NOT flag: \"$it\"", g.isSafetyQuery(it)) }
+    }
+}
+
+/** Earcons: every context gets a distinct, non-empty tone shape. */
+class EarconsTest {
+    @Test fun everyContextHasADistinctSequence() {
+        val seqs = ai.secondsense.app.context.AppContext.values().associateWith {
+            ai.secondsense.app.sonification.Earcons.sequenceFor(it)
+        }
+        seqs.values.forEach { assertTrue("non-empty", it.isNotEmpty()) }
+        val walk = ai.secondsense.app.sonification.Earcons.sequenceFor(ai.secondsense.app.context.AppContext.WALKING)
+        assertTrue("walking rises", walk.last().hz > walk.first().hz)
+        val home = ai.secondsense.app.sonification.Earcons.sequenceFor(ai.secondsense.app.context.AppContext.HOME)
+        assertTrue("home falls", home.last().hz < home.first().hz)
+        val sit = ai.secondsense.app.sonification.Earcons.sequenceFor(ai.secondsense.app.context.AppContext.SITTING)
+        assertTrue("sitting is low", sit.single().hz < 400.0)
+        assertTrue("shapes differ", seqs.values.map { it.map { n -> n.hz } }.distinct().size >= 5)
+    }
+}
+
 /** SafetyGate: worst-of-window hysteresis + LLM-output green-light detection. */
 class SafetyGateTest {
     @Test fun mostSevereWins() {

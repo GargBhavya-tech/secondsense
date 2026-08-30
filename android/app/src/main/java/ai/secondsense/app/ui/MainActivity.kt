@@ -106,6 +106,13 @@ class MainActivity : AppCompatActivity() {
     // Phase 3 — sonification spine (#18–#22)
     private lateinit var spearcon: Spearcon
     private lateinit var cueEngine: CueEngine
+    // Phase 5 — per-context tone burst on a mode switch + the panic earcon.
+    private val earcons by lazy { ai.secondsense.app.sonification.Earcons(audio) }
+    // Panic gesture: both volume keys held together.
+    private var volUpHeldAtMs = 0L
+    private var volDownHeldAtMs = 0L
+    @Volatile private var panicPending = false
+    private val panicRunnable = Runnable { triggerPanic() }
     private val targetSelector = TargetSelector()
     private val tierClassifier = TierClassifier()
     private val temporalSmoother = TemporalSmoother()   // #16
@@ -490,9 +497,9 @@ class MainActivity : AppCompatActivity() {
         // Thermal governor + activity context both feed one merge point (most-conservative wins).
         thermalGovernor.onPolicy = { runOnUiThread { applyEffectivePolicy() } }
         thermalGovernor.onNotice = { msg ->
-            speakLocalized(msg, langPrefs.speakHindi, TextToSpeech.QUEUE_ADD, "thermal")
+            runOnUiThread { announce(msg) }   // announce() translates the English line when Hindi is on
         }
-        contextManager.onContext = { _, _ -> runOnUiThread { applyEffectivePolicy() } }
+        contextManager.onContext = { ctx, _ -> runOnUiThread { applyEffectivePolicy(); earcons.play(ctx) } }
         contextManager.onAnnounce = { msg -> runOnUiThread { announce(msg); haptics.testBuzz() } }
         applyEffectivePolicy()   // apply the default (WALKING) profile from the first frame
         // --- Blind-first gesture surface. dispatchTouchEvent (below) feeds this every touch
@@ -592,13 +599,16 @@ class MainActivity : AppCompatActivity() {
      * laptop by typing the phone's LAN IP, logged below.)
      */
     private fun startDashboardServer() {
-        try {
-            dashboardServer = DashboardServer().also { it.start() }
-            DashboardServer.localIpAddress(this)?.let {
-                android.util.Log.i("SecondSense/dashboard", "telemetry at http://$it:8085/")
+        thread(name = "dashboard-start") {
+            val srv = DashboardServer()
+            if (srv.startWithRetry()) {
+                dashboardServer = srv
+                DashboardServer.localIpAddress(this)?.let {
+                    android.util.Log.i("SecondSense/dashboard", "telemetry at http://$it:8085/")
+                }
+            } else {
+                android.util.Log.w("SecondSense/dashboard", "server never bound :8085 — telemetry off")
             }
-        } catch (t: Throwable) {
-            android.util.Log.w("SecondSense/dashboard", "server start failed: ${t.message}")
         }
     }
 
@@ -723,9 +733,48 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean = when (keyCode) {
-        KeyEvent.KEYCODE_VOLUME_UP -> { repeatLast(); true }
-        KeyEvent.KEYCODE_VOLUME_DOWN -> { cycleCueVolume(); true }
+        KeyEvent.KEYCODE_VOLUME_UP -> { volUpHeldAtMs = System.currentTimeMillis(); maybeArmPanic(); if (event.repeatCount == 0) repeatLast(); true }
+        KeyEvent.KEYCODE_VOLUME_DOWN -> { volDownHeldAtMs = System.currentTimeMillis(); maybeArmPanic(); if (event.repeatCount == 0) cycleCueVolume(); true }
         else -> super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) volUpHeldAtMs = 0L
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) volDownHeldAtMs = 0L
+        if (panicPending && (volUpHeldAtMs == 0L || volDownHeldAtMs == 0L)) {
+            panicPending = false
+            binding.blindSurface.removeCallbacks(panicRunnable)   // released early — cancelled
+        }
+        return if (keyCode in intArrayOf(KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.KEYCODE_VOLUME_DOWN)) true
+        else super.onKeyUp(keyCode, event)
+    }
+
+    /** Both volume keys held together within 500 ms -> arm the 2 s panic timer. */
+    private fun maybeArmPanic() {
+        val both = volUpHeldAtMs > 0L && volDownHeldAtMs > 0L &&
+            kotlin.math.abs(volUpHeldAtMs - volDownHeldAtMs) < 500L
+        if (both && !panicPending) {
+            panicPending = true
+            binding.blindSurface.postDelayed(panicRunnable, 2000L)
+        }
+    }
+
+    /**
+     * Panic gesture fired (both volume keys held 2 s). Loud attention earcon, spoken battery +
+     * mode, then straight to "say who to call" — the transcript routes through the normal
+     * CallContact path. Says nothing to dial automatically; silence just cancels.
+     */
+    private fun triggerPanic() {
+        panicPending = false
+        earcons.panic()
+        haptics.testBuzz()
+        val batt = batteryPercent()
+        val mode = contextManager.context.name.lowercase()
+        announce("Emergency. Battery $batt percent. $mode mode. Say who to call, or stay quiet to cancel.")
+        binding.blindSurface.postDelayed({
+            if (hasMicPermission()) startVoiceCapture()
+            else requestMic.launch(Manifest.permission.RECORD_AUDIO)
+        }, 3200L)
     }
 
     // --- blind-first handlers -----------------------------------------------------------
@@ -762,19 +811,6 @@ class MainActivity : AppCompatActivity() {
         if (paused) { cueEngine.stop(); cueEngine.update(null); announce("Paused.") }
         else { if (sonifying) cueEngine.start(); announce("Resumed.") }
         updateBigStatus()
-    }
-
-    private fun toggleWalkExplore() {
-        val toExplore = !modeController.acceptsVoiceCommands
-        binding.switchMode.isChecked = toExplore   // fires existing listener -> modeController.set
-        announce(if (toExplore) "Explore mode. Stopped." else "Walk mode.")
-        updateBigStatus()
-    }
-
-    private fun enterExploreAndListen() {
-        if (!modeController.acceptsVoiceCommands) binding.switchMode.isChecked = true
-        announce("Listening. Say what you are looking for.")
-        if (hasMicPermission()) startVoiceCapture() else requestMic.launch(Manifest.permission.RECORD_AUDIO)
     }
 
     /**
@@ -855,7 +891,9 @@ class MainActivity : AppCompatActivity() {
                 "Double tap for a quick look ahead without the microphone. " +
                 "Two finger tap to pause or resume. Three finger tap for this help. " +
                 "Swipe up or down to change mode. Long press for the settings menu. " +
-                "Volume up repeats the last message. Volume down changes loudness.",
+                "Volume up repeats the last message. Volume down changes loudness. " +
+                "Hold both volume keys together for two seconds for emergency: it reads your " +
+                "battery and lets you call someone.",
         )
     }
 
@@ -1003,7 +1041,9 @@ class MainActivity : AppCompatActivity() {
                 speakLocalized(spoken, isHindi, TextToSpeech.QUEUE_FLUSH, "scene")
             }
         } else {
-            speakLocalized(text, langPrefs.speakHindi, TextToSpeech.QUEUE_FLUSH, "scene")
+            // Not translating -> the text is English, so use the English voice (not the Hindi
+            // voice mangling English words).
+            speakLocalized(text, hindi = false, TextToSpeech.QUEUE_FLUSH, "scene")
         }
     }
 
@@ -1280,7 +1320,7 @@ class MainActivity : AppCompatActivity() {
                 speakLocalized(spoken, isHi, TextToSpeech.QUEUE_FLUSH, "mem")
             }
         } else {
-            speakLocalized(english, langPrefs.speakHindi, TextToSpeech.QUEUE_FLUSH, "mem")
+            speakLocalized(english, hindi = false, TextToSpeech.QUEUE_FLUSH, "mem")
         }
     }
 
@@ -1658,5 +1698,6 @@ class MainActivity : AppCompatActivity() {
         runCatching { translator.close() }
         runCatching { llm.close() }
         runCatching { safetyVectorGate.close() }
+        runCatching { earcons.close() }
     }
 }
