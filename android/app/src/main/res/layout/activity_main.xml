@@ -165,9 +165,17 @@
                 android:id="@+id/switchTranslate"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginBottom="8dp"
+                android:layout_marginBottom="4dp"
                 android:textColor="@color/ss_text"
                 android:text="@string/translate_signs" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switchReadMode"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="8dp"
+                android:textColor="@color/ss_text"
+                android:text="@string/read_always" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnCalibrate"

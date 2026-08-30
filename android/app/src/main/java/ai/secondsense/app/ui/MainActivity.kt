@@ -225,6 +225,9 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var perceptionEnabled = true
     @Volatile private var yamnetWanted = true
     @Volatile private var lowResActive = false
+    // Admin toggle: keep the ML Kit text/sign reader running in EVERY activity context
+    // (normally it's off while walking). A genuinely HOT/CRITICAL phone still sheds it.
+    @Volatile private var forceReadMode = true
 
     // Activity context (Walking/Standing/Sitting/Home/Transit/Conversation) — reconfigures the
     // whole pipeline; merged with the thermal policy in applyEffectivePolicy().
@@ -488,6 +491,17 @@ class MainActivity : AppCompatActivity() {
         binding.switchTranslate.isChecked = langPrefs.translateSigns
         binding.switchTranslate.setOnCheckedChangeListener { _, checked ->
             langPrefs.translateSigns = checked
+        }
+
+        // "Always read text & signs": keep the ML Kit reader running in every context
+        // (default on). Persisted so it survives a restart.
+        forceReadMode = uiPrefs.getBoolean("force_read_mode", true)
+        binding.switchReadMode.isChecked = forceReadMode
+        binding.switchReadMode.setOnCheckedChangeListener { _, checked ->
+            forceReadMode = checked
+            uiPrefs.edit().putBoolean("force_read_mode", checked).apply()
+            applyEffectivePolicy()
+            announce(if (checked) "Always reading text." else "Text reading follows the mode again.")
         }
 
         // Double-tap the camera preview -> speak "what's around me" (offline, no LLM).
@@ -913,10 +927,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun speakHelp() {
         announce(
-            "One tap anywhere wakes me. After the beep, just say what you want. " +
-                "For example: find my keys. What's ahead. Read this. Where did I leave my phone. " +
-                "Status. I'm sitting. Stop the beeping. Speak Hindi. Or say repeat. " +
-                "Double tap for a quick look ahead without the microphone. " +
+            "One tap, anywhere except the top of the screen, wakes me for a command. " +
+                "After the beep, say what you want. For example: find my keys. What's ahead. " +
+                "Read this. Where did I leave my phone. Status. I'm sitting. Stop the beeping. " +
+                "Speak Hindi. Or say repeat. " +
+                "Tap the top of the screen, or double tap anywhere, for a quick look ahead " +
+                "without the microphone. " +
                 "Two finger tap to pause or resume. Three finger tap for this help. " +
                 "Swipe up or down to change mode. Long press for the settings menu. " +
                 "Volume up repeats the last message. Volume down changes loudness. " +
@@ -1042,7 +1058,9 @@ class MainActivity : AppCompatActivity() {
         analyzer.processEveryN = maxOf(tFrame, c.detectEveryN)
         engine.setDepthEveryN(maxOf(tDepth, c.depthEveryN))
         engine.setHazardEveryN(if (!c.hazardEnabled) 0 else maxOf(tHazard, 1))
-        perceptionEnabled = t.auxEnabled && c.auxPerception
+        // "Always read text" (admin) forces the sign/text reader on in every context; the
+        // thermal policy's auxEnabled still wins on a genuinely hot phone.
+        perceptionEnabled = t.auxEnabled && (c.auxPerception || forceReadMode)
 
         val wantYamnet = t.yamnetEnabled && c.auxPerception
         if (wantYamnet != yamnetWanted) {
